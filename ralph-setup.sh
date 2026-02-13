@@ -666,9 +666,11 @@ process_ralph_template() {
       output=$(echo "$output" | sed '/<!--ralph-option:git_once-->/,/<!--\/ralph-option:git_once-->/d')
       output=$(echo "$output" | sed '/<!--ralph-option:git_each-->/,/<!--\/ralph-option:git_each-->/d')
       output=$(echo "$output" | sed '/<!--ralph-option:git_squash-->/,/<!--\/ralph-option:git_squash-->/d')
-      output=$(echo "$output" | sed '/<!--ralph-option:pr_merge_clean-->/,/<!--\/ralph-option:pr_merge_clean-->/d')
-      output=$(echo "$output" | sed '/<!--ralph-option:pr_merge_force-->/,/<!--\/ralph-option:pr_merge_force-->/d')
-      output=$(echo "$output" | sed '/<!--ralph-option:pr_no_merge-->/,/<!--\/ralph-option:pr_no_merge-->/d')
+      output=$(echo "$output" | sed '/<!--ralph-option:pr_open-->/,/<!--\/ralph-option:pr_open-->/d')
+      output=$(echo "$output" | sed '/<!--ralph-option:pr_merge-->/,/<!--\/ralph-option:pr_merge-->/d')
+      output=$(echo "$output" | sed '/<!--ralph-option:pr_no-->/,/<!--\/ralph-option:pr_no-->/d')
+      output=$(echo "$output" | sed '/<!--ralph-option:pr_push-->/,/<!--\/ralph-option:pr_push-->/d')
+      output=$(echo "$output" | sed '/<!--ralph-option:pr_automerge-->/,/<!--\/ralph-option:pr_automerge-->/d')
       ;;
     once)
       output=$(echo "$output" | sed '/<!--ralph-option:git_never-->/,/<!--\/ralph-option:git_never-->/d')
@@ -689,22 +691,20 @@ process_ralph_template() {
 
   # Process PR strategy
   case "$pr_strategy" in
-    merge_clean)
-      output=$(echo "$output" | sed '/<!--ralph-option:pr_merge_force-->/,/<!--\/ralph-option:pr_merge_force-->/d')
-      output=$(echo "$output" | sed '/<!--ralph-option:pr_no_merge-->/,/<!--\/ralph-option:pr_no_merge-->/d')
+    open)
+      output=$(echo "$output" | sed '/<!--ralph-option:pr_merge-->/,/<!--\/ralph-option:pr_merge-->/d')
+      output=$(echo "$output" | sed '/<!--ralph-option:pr_no-->/,/<!--\/ralph-option:pr_no-->/d')
+      output=$(echo "$output" | sed '/<!--ralph-option:pr_automerge-->/,/<!--\/ralph-option:pr_automerge-->/d')
       ;;
-    merge_force)
-      output=$(echo "$output" | sed '/<!--ralph-option:pr_merge_clean-->/,/<!--\/ralph-option:pr_merge_clean-->/d')
-      output=$(echo "$output" | sed '/<!--ralph-option:pr_no_merge-->/,/<!--\/ralph-option:pr_no_merge-->/d')
+    merge)
+      output=$(echo "$output" | sed '/<!--ralph-option:pr_open-->/,/<!--\/ralph-option:pr_open-->/d')
+      output=$(echo "$output" | sed '/<!--ralph-option:pr_no-->/,/<!--\/ralph-option:pr_no-->/d')
       ;;
-    no_merge)
-      output=$(echo "$output" | sed '/<!--ralph-option:pr_merge_clean-->/,/<!--\/ralph-option:pr_merge_clean-->/d')
-      output=$(echo "$output" | sed '/<!--ralph-option:pr_merge_force-->/,/<!--\/ralph-option:pr_merge_force-->/d')
-      ;;
-    none)
-      output=$(echo "$output" | sed '/<!--ralph-option:pr_merge_clean-->/,/<!--\/ralph-option:pr_merge_clean-->/d')
-      output=$(echo "$output" | sed '/<!--ralph-option:pr_merge_force-->/,/<!--\/ralph-option:pr_merge_force-->/d')
-      output=$(echo "$output" | sed '/<!--ralph-option:pr_no_merge-->/,/<!--\/ralph-option:pr_no_merge-->/d')
+    no)
+      output=$(echo "$output" | sed '/<!--ralph-option:pr_open-->/,/<!--\/ralph-option:pr_open-->/d')
+      output=$(echo "$output" | sed '/<!--ralph-option:pr_merge-->/,/<!--\/ralph-option:pr_merge-->/d')
+      output=$(echo "$output" | sed '/<!--ralph-option:pr_push-->/,/<!--\/ralph-option:pr_push-->/d')
+      output=$(echo "$output" | sed '/<!--ralph-option:pr_automerge-->/,/<!--\/ralph-option:pr_automerge-->/d')
       ;;
   esac
 
@@ -870,19 +870,17 @@ main() {
   # ========================================
   # Question 2: PR Strategy (if committing)
   # ========================================
-  PR_STRATEGY="none"
+  PR_STRATEGY="no"
   if [[ "$GIT_STRATEGY" != "never" ]]; then
-    PR=$(ask "Create PR when task is complete?" \
-      "Yes, merge if clean - Create PR, merge if no conflicts (Recommended)" \
-      "Yes, force merge - Create PR, resolve conflicts automatically" \
-      "Yes, no merge - Create PR but don't merge" \
-      "No - Don't create PR")
+    PR=$(ask "Auto-open a PR when task is complete?" \
+      "Yes, open PR but don't merge (Recommended)" \
+      "Yes, open PR and auto-merge if clean" \
+      "No — keep the branch local")
 
     case "$PR" in
-      1) PR_STRATEGY="merge_clean" ;;
-      2) PR_STRATEGY="merge_force" ;;
-      3) PR_STRATEGY="no_merge" ;;
-      4) PR_STRATEGY="none" ;;
+      1) PR_STRATEGY="open" ;;
+      2) PR_STRATEGY="merge" ;;
+      3) PR_STRATEGY="no" ;;
     esac
   fi
 

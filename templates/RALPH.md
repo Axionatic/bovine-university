@@ -123,42 +123,35 @@ Parent stops (loop restarts fresh)
 - Final: Squash all WIP commits into single descriptive commit
 <!--/ralph-option:git_squash-->
 
-<!--ralph-option:pr_strategy
-{
-  "id": "pr_strategy",
-  "question": "PR creation?",
-  "default": 1,
-  "options": [
-    {"value": "merge_clean", "label": "Create PR, merge if clean (Recommended)"},
-    {"value": "merge_force", "label": "Create PR, force merge"},
-    {"value": "no_merge", "label": "Create PR, don't merge"},
-    {"value": "none", "label": "No PR"}
-  ]
-}
--->
+<!--ralph-option:pr_open-->
+**Branch Strategy**: Push branch and open a PR when task is complete.
+<!--/ralph-option:pr_open-->
 
-<!--ralph-option:pr_merge_clean-->
-**PR Strategy**: Create PR when complete. Merge automatically if no conflicts.
-<!--/ralph-option:pr_merge_clean-->
+<!--ralph-option:pr_merge-->
+**Branch Strategy**: Push branch, open a PR, and auto-merge if there are no conflicts.
+<!--/ralph-option:pr_merge-->
 
-<!--ralph-option:pr_merge_force-->
-**PR Strategy**: Create PR when complete. Force merge, resolving conflicts automatically.
-<!--/ralph-option:pr_merge_force-->
-
-<!--ralph-option:pr_no_merge-->
-**PR Strategy**: Create PR when complete but do not merge.
-<!--/ralph-option:pr_no_merge-->
+<!--ralph-option:pr_no-->
+**Branch Strategy**: Work in a feature branch but do not push or open a PR.
+<!--/ralph-option:pr_no-->
 
 <!--/ralph-option:git_strategy-->
 
 ### On Task Completion
-1. Commit final changes (per git strategy above)
-2. Push branch to origin: `git push -u origin HEAD`
-3. If PR strategy is configured:
-   - Check if PR exists: `gh pr list --head $(git branch --show-current) --json number`
-   - If no PR: create one with `gh pr create --fill`
-   - If PR exists: push updates the existing PR automatically
-4. Output completion promise
+- Commit final changes (per git strategy above)
+<!--ralph-option:pr_push-->
+- Push branch to origin: `git push -u origin HEAD`
+- Open PR if none exists:
+  - Check: `gh pr list --head $(git branch --show-current) --json number`
+  - Create: `gh pr create --fill`
+<!--/ralph-option:pr_push-->
+<!--ralph-option:pr_automerge-->
+- Auto-merge if no conflicts: `gh pr merge --auto --merge`
+<!--/ralph-option:pr_automerge-->
+<!--ralph-option:pr_push-->
+- **If push or PR creation fails** (e.g. `gh` not available, auth issues, network blocked): log the failure in progress.md and output a warning: `⚠️ Could not push/create PR automatically. Please push the branch and open a PR manually.` Do NOT let this block the completion promise.
+<!--/ralph-option:pr_push-->
+- Output completion promise
 
 <!--ralph-option:pr_review_toolkit
 {
