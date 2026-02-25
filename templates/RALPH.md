@@ -4,30 +4,44 @@ Autonomous development via [ralph-wiggum](https://github.com/anthropics/claude-c
 
 ## Core Rules (Parent Orchestrator)
 
-1. **USE SUB-AGENTS**: Never do implementation work directly. Spawn a sub-agent for each step. This keeps your context minimal.
+1. **USE SUB-AGENTS**: Never do implementation work directly. Use the **Task tool** to spawn a sub-agent for each step. This keeps your context minimal.
 2. **One step per iteration**: Determine ONE logical step, spawn sub-agent, receive summary, update progress. Then stop.
-3. **Minimal prompts**: Generate step-specific prompts for sub-agents. Never pass the full task description repeatedly.
-4. **CRITICAL: Update progress.md BEFORE stopping.** Every iteration MUST end with an update to `.claude/ralph/progress.md`. The next iteration reads this file to determine what to do — if you don't update it, the next iteration will repeat the same work or get confused. Update the Current section, move completed items to Completed, and log the iteration.
-5. **Sandbox + bypass mode**: You are running with `--dangerously-skip-permissions` inside a sandbox. Deny rules in `.claude/settings.local.json` block dangerous commands. The sandbox blocks unauthorized network and filesystem access.
-6. **Feature branches**: The preflight hook auto-creates a `ralph/<task-slug>` branch when on main/master. Do not force-push to main or master.
-7. **Document blockers**: If truly blocked, log the issue in progress.md and continue with other tasks.
-8. **Completion promise format**: When task is complete, output `<promise>YOUR_PHRASE</promise>` (XML tags required).
+3. **Context window**: If context is > 50% full, stop immediately and let the loop restart fresh.
+4. **Minimal prompts**: Generate step-specific prompts for sub-agents. Never pass the full task description repeatedly.
+5. **CRITICAL: Update your session progress file BEFORE stopping.** Every iteration MUST end with an update to your session progress file (resolved via `.claude/ralph/.active`). The next iteration reads this file to determine what to do — if you don't update it, the next iteration will repeat the same work or get confused. Update the Current section, move completed items to Completed, and log the iteration.
+6. **Sandbox + bypass mode**: You are running with `--dangerously-skip-permissions` inside a sandbox. Deny rules in `.claude/settings.local.json` block dangerous commands. The sandbox blocks unauthorized network and filesystem access. Sub-agents inherit all sandbox restrictions and deny rules from the parent session.
+7. **Feature branches**: The preflight hook auto-creates a `ralph/<task-slug>` branch when on main/master. Do not force-push to main or master.
+8. **Document blockers**: If truly blocked, log the issue in the Blockers section of your session progress file, skip to the next unblocked step, and stop. The next iteration will pick up from there.
+9. **Completion promise format**: When task is complete, output `<promise>YOUR_PHRASE</promise>` (XML tags required).
+
+## Session Management
+
+The preflight hook creates a session-stamped progress file for each run:
+- Copies your task from `progress.md` into `progress-<session-id>.md`
+- Writes the session ID to `.claude/ralph/.active`
+- Resets `progress.md` to a blank template
+
+**Resolving your progress file (every iteration):**
+1. Read `.claude/ralph/.active` to get `<session-id>`
+2. Use `.claude/ralph/progress-<session-id>.md` — NOT `progress.md`
+
+**On task completion:** Delete `.claude/ralph/.active` after outputting the completion promise.
 
 ## Sub-Agent Prompt Template
 
-When spawning a sub-agent, use this minimal format:
+Use the **Task tool** to spawn sub-agents. Provide this minimal prompt format:
 
 ```
 Step: [Specific action to take]
 Location: [File path(s) if applicable]
 Context: [1-2 sentences of relevant context]
-Reference: .claude/ralph/progress.md for full task context if needed
+Reference: Session progress file (via .claude/ralph/.active) for full task context if needed
 Report: [What to return - summary, line count, status, etc.]
 ```
 
 ## Progress Tracking
 
-**Enabled**: Progress tracked in `.claude/ralph/progress.md`. This is the source of truth.
+**Enabled**: Progress tracked in session progress file (resolved via `.claude/ralph/.active`). This is the source of truth.
 
 ### Workflow (with sub-agents)
 1. **Plan** - First iteration: Spawn sub-agent to analyze task, produce step list
@@ -66,7 +80,7 @@ Sub-agent: Implementing createTodo function
 
 ### Sub-Agent Interaction Pattern
 ```
-Parent reads progress.md -> "Step 2 is next: Implement createTodo"
+Parent reads session progress file -> "Step 2 is next: Implement createTodo"
                          |
                          v
 Parent spawns sub-agent: "Implement createTodo in src/api/todos.ts.
@@ -80,7 +94,7 @@ Sub-agent works (isolated context)
 Sub-agent returns: "Implemented createTodo with validation, 45 lines"
                          |
                          v
-Parent updates progress.md with summary
+Parent updates session progress file with summary
                          |
                          v
 Parent stops (loop restarts fresh)
@@ -92,10 +106,10 @@ Parent stops (loop restarts fresh)
   "question": "Git commit strategy?",
   "default": 4,
   "options": [
-    {"value": "never", "label": "Never - Manual git"},
-    {"value": "once", "label": "Once - On task completion"},
-    {"value": "each", "label": "Each - After every loop"},
-    {"value": "squash", "label": "Squash - Each loop, squash at end (Recommended)"}
+    {"value": "never", "label": "Never - I'll handle git myself"},
+    {"value": "once", "label": "Once - Commit when task is complete"},
+    {"value": "each", "label": "Each loop - Commit after every iteration"},
+    {"value": "squash", "label": "Squash - Commit each loop, squash when done (Recommended)"}
   ]
 }
 -->
@@ -114,13 +128,18 @@ Parent stops (loop restarts fresh)
 <!--ralph-option:git_each-->
 **Each Loop**: Commit after every iteration.
 - Prefix: `ralph: <brief description>`
+- After each step: (1) update session progress file, (2) run quality gates, (3) `git add` + `git commit`, (4) stop
 - Creates detailed history, may need manual cleanup
 <!--/ralph-option:git_each-->
 
 <!--ralph-option:git_squash-->
 **Squash**: Commit after each loop, squash when task completes.
 - During: `WIP: ralph - <step description>`
-- Final: Squash all WIP commits into single descriptive commit
+- Final: Squash all WIP commits into a single descriptive commit:
+  ```bash
+  git reset --soft $(git merge-base HEAD <base-branch>) && git commit -m "<descriptive message>"
+  ```
+  where `<base-branch>` is the branch you branched from (typically `main` or `master`).
 <!--/ralph-option:git_squash-->
 
 <!--ralph-option:pr_open-->
@@ -149,8 +168,10 @@ Parent stops (loop restarts fresh)
 - Auto-merge if no conflicts: `gh pr merge --auto --merge`
 <!--/ralph-option:pr_automerge-->
 <!--ralph-option:pr_push-->
-- **If push or PR creation fails** (e.g. `gh` not available, auth issues, network blocked): log the failure in progress.md and output a warning: `⚠️ Could not push/create PR automatically. Please push the branch and open a PR manually.` Do NOT let this block the completion promise.
+- **If push or PR creation fails** (e.g. `gh` not available, auth issues, network blocked): log the failure in your session progress file and output a warning: `⚠️ Could not push/create PR automatically. Please push the branch and open a PR manually.` Do NOT let this block the completion promise.
 <!--/ralph-option:pr_push-->
+- **If any git/push/PR operation fails**: log the failure in your session progress file and output a warning. Do NOT let it block the completion promise.
+- Delete `.claude/ralph/.active`
 - Output completion promise
 
 <!--ralph-option:pr_review_toolkit
@@ -159,7 +180,7 @@ Parent stops (loop restarts fresh)
   "question": "Use pr-review-toolkit for code review?",
   "default": 1,
   "options": [
-    {"value": "yes", "label": "Yes - Automated review agents (Recommended)"},
+    {"value": "yes", "label": "Yes - Run code review agents during review phase (Recommended)"},
     {"value": "no", "label": "No - Skip automated review"}
   ]
 }
@@ -168,11 +189,13 @@ Parent stops (loop restarts fresh)
 ## Code Review
 
 <!--ralph-option:pr_review_yes-->
-Use pr-review-toolkit agents during review phase:
+Use pr-review-toolkit agents during the **review phase** (workflow step 3, after all implementation steps are complete):
 - `code-reviewer` - Check adherence to guidelines
 - `silent-failure-hunter` - Find error handling issues
 - `comment-analyzer` - Verify comment accuracy
 
+**Invocation:** Only invoke during review iterations. Do not invoke during planning or implementation.
+**Fallback:** If pr-review-toolkit agents are unavailable (tool not found, plugin not installed), fall back to manual self-review: re-read all changed files and check for obvious issues, missed edge cases, and guideline violations.
 Note: Consumes additional tokens. Disable if context is limited.
 <!--/ralph-option:pr_review_yes-->
 
@@ -186,6 +209,10 @@ Skip automated review. Manual review only.
 <!--ralph-option:quality_gates-->
 Run these commands to validate changes before committing:
 <!--ralph-quality-gate-commands-->
+All quality gate commands must exit 0 before committing. If any gate fails:
+1. Fix the issues identified by the failing gate
+2. Re-run the gate to confirm the fix
+3. Only then proceed to commit
 <!--/ralph-option:quality_gates-->
 
 ## Invocation

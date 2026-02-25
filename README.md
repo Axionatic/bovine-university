@@ -12,7 +12,7 @@ Unfortunately, Ralph is not a good match for Claude Code.
 - Ralph is quick to give up when something doesn't work. Claude will hammer away until your wallet cries out in pain.
 - Ralph quite happily forgets things. Claude tries very hard to remember everything (but sometimes forgets anyway).
 
-Bovine University is a very simple set of rules to teach Anthropic's [official ralph-wiggum plugin](https://github.com/anthropics/claude-code/tree/main/plugins/ralph-wiggum) to be more ralph-like and less claude-like.
+Bovine University is a simple set of rules to teach Anthropic's [official ralph-wiggum plugin](https://github.com/anthropics/claude-code/tree/main/plugins/ralph-wiggum) to be more ralph-like and less claude-like.
 If you've tried using the plugin, you might have noticed:
 - Even though Ralph is supposed to do things in small, iterative loops, Claude tries to complete the entire prompt in one go.
 - Even though Ralph is supposed to run autonomously, Claude frequently pauses and asks for permissions.
@@ -39,7 +39,7 @@ The setup script will:
 1. **Detect your ecosystem** — scans for package.json, Cargo.toml, go.mod, pyproject.toml, etc. and configures allowed network domains accordingly
 2. **Detect frameworks** — identifies build tools, test runners, and linters to set up quality gate commands
 3. Ask about **git strategy** (never / once / each / squash)
-4. Ask about **PR strategy** (merge if clean / force merge / no merge / none)
+4. Ask about **PR strategy** (open PR / open PR and auto-merge / keep local)
 5. Ask about **code review** (pr-review-toolkit yes/no)
 
 ## What Gets Installed
@@ -47,33 +47,41 @@ The setup script will:
 ```
 your-project/
 ├── .claude/
-│   ├── RALPH.md              # Rules for Ralph behavior
-│   ├── settings.local.json   # Deny rules + sandbox config
+│   ├── RALPH.md                    # Rules for Ralph behavior
+│   ├── settings.local.json         # Deny rules + sandbox config
 │   ├── ralph/
-│   │   └── progress.md       # Task tracking file
+│   │   ├── progress.md             # Task file (edit before starting)
+│   │   └── .progress-template      # Blank template for session reset
 │   └── hooks/
-│       └── ralph-preflight.sh  # Validates environment + auto-branches
-└── CLAUDE.md                 # Updated to reference RALPH.md
+│       └── ralph-preflight.sh      # Validates environment + auto-branches
+└── CLAUDE.md                       # Updated to reference RALPH.md
 ```
+
+At runtime, the preflight hook also creates:
+- `.claude/ralph/.active` — current session ID marker
+- `.claude/ralph/progress-<session-id>.md` — session-stamped progress file
+- `.claude/ralph/archive/` — archived progress files from previous sessions (max 10)
+
+The ralph-wiggum plugin creates `.claude/ralph-loop.local.md` while a loop is running. The preflight hook uses this to detect and block concurrent loops.
 
 ## How It Works: Sub-Agent Architecture
 
 The key insight is that **sub-agents provide context isolation**. Instead of the main session doing all the work (and accumulating context), we use a parent orchestrator that:
 
-1. Reads `progress.md` to determine the next step
+1. Reads the session progress file to determine the next step
 2. Spawns a sub-agent with a minimal, step-specific prompt
 3. Receives only the summary back (not the full working context)
-4. Updates `progress.md` with results
+4. Updates the session progress file with results
 5. Stops (loop restarts fresh)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  Parent Orchestrator (minimal context)                      │
-│  ├── Reads progress.md                                      │
+│  ├── Reads session progress file                            │
 │  ├── Determines next step                                   │
 │  ├── Generates minimal, step-specific prompt                │
-│  ├── Spawns sub-agent ──────────┐                          │
-│  │                               ▼                          │
+│  ├── Spawns sub-agent ──────────┐                           │
+│  │                              ▼                           │
 │  │                    ┌──────────────────────┐              │
 │  │                    │  Sub-Agent           │              │
 │  │                    │  (isolated context)  │              │
@@ -83,7 +91,7 @@ The key insight is that **sub-agents provide context isolation**. Instead of the
 │  │                    └──────────────────────┘              │
 │  │                               │                          │
 │  ├── Receives summary only ◄─────┘                          │
-│  ├── Updates progress.md                                    │
+│  ├── Updates session progress file                          │
 │  └── Loop or complete                                       │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -97,7 +105,7 @@ The official ralph-wiggum plugin has two context issues:
 
 The sub-agent approach solves both:
 - Sub-agent context is isolated and discarded after each step
-- The prompt is minimal ("Continue per progress.md") - task details live in the file
+- The prompt is minimal ("Continue per progress.md") — task details live in the file
 
 ## Security Model
 
@@ -106,16 +114,23 @@ Two layers provide defense in depth:
 ```
 Layer 1: Built-in Sandbox (OS-level)
   - Network isolation (only detected ecosystem domains allowed)
-  - Filesystem boundaries (secrets, config files protected)
+  - Filesystem read protection (~/.ssh, ~/.aws, ~/.gnupg, ~/.config/gcloud,
+    ~/.kube, ~/.docker, ~/.git-credentials, ~/.config/gh, ~/.npmrc, ~/.netrc)
+  - Filesystem write protection (.env, .env.*, *.pem, *.key,
+    .claude/settings*, .claude/RALPH.md, .claude/hooks/*)
+  - Blocks unsandboxed commands (allowUnsandboxedCommands: false)
   - Uses bubblewrap (Linux) or Seatbelt (macOS)
 
 Layer 2: Deny Rules (Application-level)
-  - Blocks: sudo, eval, exec, bash -c, pipe-to-shell
-  - Blocks: force-push to main/master
-  - Blocks: privilege escalation (chmod +s, chown)
+  - Blocks: sudo, su, privilege escalation (chmod +s, chown)
+  - Blocks: shell interpreters (bash -c, sh -c, zsh -c, dash -c, ksh -c)
+  - Blocks: inline code execution (python -c, perl -e, ruby -e, node -e)
+  - Blocks: pipe-to-shell (curl|bash, curl|sh, wget|bash, wget|sh)
+  - Blocks: force-push to main/master (--force, -f, --force-with-lease, +refspec)
+  - Blocks: eval, exec
 ```
 
-The preflight hook validates both layers are active before allowing a ralph-loop to start.
+The preflight hook validates the environment (sandbox enabled, bypass-permissions active) before allowing a ralph-loop to start.
 
 ## Ecosystem Detection
 
@@ -159,6 +174,8 @@ Status: not_started
 (pending)
 ```
 
+> **Note:** When the loop starts, the preflight hook copies your task into a session-stamped file (`progress-<session-id>.md`) and resets `progress.md` to a blank template. Claude works with the session file, not `progress.md` directly.
+
 ### Step 2: Start the Loop
 
 ```bash
@@ -169,7 +186,11 @@ claude --dangerously-skip-permissions
 The preflight hook automatically:
 - Verifies sandbox is enabled
 - Verifies `--dangerously-skip-permissions` is active
-- Creates a `ralph/<task-slug>` branch if on main/master
+- Detects and blocks concurrent loops
+- Archives stale sessions from cancelled runs
+- Creates a session-stamped progress file from your task
+- Creates a `ralph/<task-slug>` branch if on main/master (or switches to it if it already exists)
+- Checks for dirty working directory before branching
 
 Only "Continue per .claude/ralph/progress.md" gets duplicated each iteration — the actual task lives in the file.
 
@@ -177,15 +198,18 @@ Only "Continue per .claude/ralph/progress.md" gets duplicated each iteration —
 
 - You are in a loop. Do one single step of your task, then stop. The loop will handle the rest.
 - **Use sub-agents**: Never do implementation work directly. Spawn a sub-agent for each step.
-- **Update progress.md before stopping** — this is the single most important rule. If progress.md isn't updated, the next iteration repeats the same work.
+- **Update the session progress file before stopping** — this is the single most important rule. If it isn't updated, the next iteration repeats the same work.
+- **Keep prompts minimal**: Generate step-specific prompts for sub-agents. Never pass the full task description repeatedly.
 - If the current step is taking a long time, check your context window. If it's > 50% full, stop immediately and let the loop take over.
-- First loop plans. Second loop implements. Third loop reviews. Fourth loop fixes issues. Repeat.
+- **Document blockers**: If truly blocked, log it in the progress file, skip to the next unblocked step, and stop.
+- First loop plans. Then implement (one step per loop). Then review. Then fix issues. Then complete (push, PR, completion promise).
+- **Completion promise**: When done, output `<promise>YOUR_PHRASE</promise>` (XML tags required).
 
 ## How Can We Be Fully Autonomous?
 
 With `--dangerously-skip-permissions`, deny rules still take precedence. We:
 - Run inside Claude Code's built-in sandbox for OS-level network and filesystem isolation
-- Define deny rules in `.claude/settings.local.json` to block dangerous commands (sudo, eval, force-push to main, etc.)
+- Define deny rules in `.claude/settings.local.json` to block dangerous commands (sudo, su, shell interpreters, inline code execution, pipe-to-shell, force-push to main, privilege escalation)
 - Use a preflight hook that validates the environment before allowing a loop to start
 
 No external tools, no wrapper scripts, no scratchpad directories. Just `claude --dangerously-skip-permissions`.
