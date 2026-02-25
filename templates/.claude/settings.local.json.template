@@ -5,6 +5,11 @@
       "Bash(chmod +s:*)", "Bash(chmod u+s:*)", "Bash(chown:*)",
       "Bash(eval:*)", "Bash(exec:*)",
       "Bash(bash -c:*)", "Bash(sh -c:*)",
+      "Bash(zsh -c:*)", "Bash(dash -c:*)", "Bash(ksh -c:*)",
+      "Bash(python -c:*)", "Bash(python3 -c:*)",
+      "Bash(perl -e:*)", "Bash(perl -E:*)",
+      "Bash(ruby -e:*)",
+      "Bash(node -e:*)", "Bash(node --eval:*)",
       "Bash(curl * | bash:*)", "Bash(curl * | sh:*)",
       "Bash(wget * | bash:*)", "Bash(wget * | sh:*)",
       "Bash(git push --force origin main:*)",
@@ -12,7 +17,11 @@
       "Bash(git push -f origin main:*)",
       "Bash(git push -f origin master:*)",
       "Bash(git push --force-with-lease origin main:*)",
-      "Bash(git push --force-with-lease origin master:*)"
+      "Bash(git push --force-with-lease origin master:*)",
+      "Bash(git push origin +refs/heads/main:*)",
+      "Bash(git push origin +refs/heads/master:*)",
+      "Bash(git push origin +main:*)",
+      "Bash(git push origin +master:*)"
     ]
   },
   "sandbox": {
@@ -22,8 +31,16 @@
       "allowedDomains": []
     },
     "filesystem": {
-      "denyRead": ["~/.ssh", "~/.aws", "~/.gnupg", "~/.config/gcloud"],
-      "denyWrite": [".claude/settings*", ".claude/RALPH.md", ".env", ".env.*", "*.pem", "*.key"]
+      "denyRead": [
+        "~/.ssh", "~/.aws", "~/.gnupg", "~/.config/gcloud",
+        "~/.kube", "~/.docker", "~/.git-credentials",
+        "~/.config/gh", "~/.npmrc", "~/.netrc"
+      ],
+      "denyWrite": [
+        ".claude/settings*", ".claude/RALPH.md",
+        ".claude/hooks/*",
+        ".env", ".env.*", "*.pem", "*.key"
+      ]
     }
   },
   "hooks": {
