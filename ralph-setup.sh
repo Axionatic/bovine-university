@@ -97,6 +97,20 @@ ask() {
   fi
 }
 
+# Validate domain format: alphanumeric, hyphens, dots only. No wildcards.
+validate_domain() {
+  local domain="$1"
+  if [[ "$domain" == *'*'* ]] || [[ "$domain" == *'?'* ]]; then
+    warn "Wildcards not allowed in domains: '$domain' (skipped)"
+    return 1
+  fi
+  if [[ ! "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]]; then
+    warn "Invalid domain format: '$domain' (skipped). Use format: example.com"
+    return 1
+  fi
+  return 0
+}
+
 # ========================================
 # Ecosystem detection
 # ========================================
@@ -106,7 +120,7 @@ detect_ecosystems() {
   DETECTED_DOMAINS=()
 
   # Always-included base domains
-  DETECTED_DOMAINS+=("api.anthropic.com" "github.com" "api.github.com" "raw.githubusercontent.com")
+  DETECTED_DOMAINS+=("api.anthropic.com" "github.com" "api.github.com")
 
   # Node.js
   if [[ -f "$dir/package.json" ]] || [[ -f "$dir/yarn.lock" ]] || [[ -f "$dir/pnpm-lock.yaml" ]] || [[ -f "$dir/bun.lockb" ]]; then
@@ -741,7 +755,7 @@ process_ralph_template() {
 update_claude_md() {
   local project_dir="$1"
   local marker="<!-- Ralph Loop Detection -->"
-  local rule='If `.claude/ralph-loop.local.md` exists, follow rules in `.claude/RALPH.md`.'
+  local rule='If `.claude/RALPH.md` exists, follow rules in `.claude/RALPH.md`.'
 
   if [[ -f "$project_dir/CLAUDE.md" ]]; then
     if ! grep -q "$marker" "$project_dir/CLAUDE.md"; then
@@ -833,7 +847,7 @@ main() {
         IFS=',' read -ra EXTRA_DOMAINS <<< "$CUSTOM_DOMAINS"
         for d in "${EXTRA_DOMAINS[@]}"; do
           d=$(echo "$d" | xargs) # trim whitespace
-          [[ -n "$d" ]] && DETECTED_DOMAINS+=("$d")
+          [[ -n "$d" ]] && validate_domain "$d" && DETECTED_DOMAINS+=("$d")
         done
       fi
     fi
@@ -846,7 +860,7 @@ main() {
       IFS=',' read -ra EXTRA_DOMAINS <<< "$CUSTOM_DOMAINS"
       for d in "${EXTRA_DOMAINS[@]}"; do
         d=$(echo "$d" | xargs)
-        [[ -n "$d" ]] && DETECTED_DOMAINS+=("$d")
+        [[ -n "$d" ]] && validate_domain "$d" && DETECTED_DOMAINS+=("$d")
       done
     fi
   fi
@@ -928,18 +942,48 @@ main() {
   fetch_template ".claude/ralph/progress.md.template" > "$PROJECT_ROOT/.claude/ralph/progress.md"
   success "Created .claude/ralph/progress.md"
 
+  # Install progress template as reset source for session management
+  cp "$PROJECT_ROOT/.claude/ralph/progress.md" "$PROJECT_ROOT/.claude/ralph/.progress-template"
+  success "Created .claude/ralph/.progress-template"
+
   # Fetch settings.local.json and inject domains
-  info "Fetching settings.local.json..."
-  SETTINGS_TEMPLATE=$(fetch_template ".claude/settings.local.json.template")
+  local EXISTING_SETTINGS="$PROJECT_ROOT/.claude/settings.local.json"
+  local SKIP_SETTINGS=""
 
-  # Deduplicate domains
-  local unique_domains=($(printf '%s\n' "${DETECTED_DOMAINS[@]}" | sort -u))
+  if [[ -f "$EXISTING_SETTINGS" ]]; then
+    echo ""
+    warn "Existing .claude/settings.local.json detected."
+    echo "  Re-running setup will overwrite custom deny rules and domain configurations."
+    echo ""
+    read -p "  Overwrite? [y/N]: " OVERWRITE_CONFIRM
+    if [[ "$OVERWRITE_CONFIRM" != "y" && "$OVERWRITE_CONFIRM" != "Y" ]]; then
+      read -p "  Update allowed network domains only? [y/N]: " DOMAIN_ONLY
+      if [[ "$DOMAIN_ONLY" == "y" || "$DOMAIN_ONLY" == "Y" ]]; then
+        local unique_domains=($(printf '%s\n' "${DETECTED_DOMAINS[@]}" | sort -u))
+        SETTINGS_JSON=$(jq --argjson domains "$(printf '%s\n' "${unique_domains[@]}" | jq -R . | jq -s .)" \
+          '.sandbox.network.allowedDomains = $domains' "$EXISTING_SETTINGS")
+        echo "$SETTINGS_JSON" > "$EXISTING_SETTINGS"
+        success "Updated network domains in existing settings.local.json"
+      else
+        info "Keeping existing settings.local.json unchanged."
+      fi
+      SKIP_SETTINGS=true
+    fi
+  fi
 
-  # Inject domains via jq
-  SETTINGS_JSON=$(echo "$SETTINGS_TEMPLATE" | jq --argjson domains "$(printf '%s\n' "${unique_domains[@]}" | jq -R . | jq -s .)" \
-    '.sandbox.network.allowedDomains = $domains')
-  echo "$SETTINGS_JSON" > "$PROJECT_ROOT/.claude/settings.local.json"
-  success "Created .claude/settings.local.json"
+  if [[ "$SKIP_SETTINGS" != "true" ]]; then
+    info "Fetching settings.local.json..."
+    SETTINGS_TEMPLATE=$(fetch_template ".claude/settings.local.json.template")
+
+    # Deduplicate domains
+    local unique_domains=($(printf '%s\n' "${DETECTED_DOMAINS[@]}" | sort -u))
+
+    # Inject domains via jq
+    SETTINGS_JSON=$(echo "$SETTINGS_TEMPLATE" | jq --argjson domains "$(printf '%s\n' "${unique_domains[@]}" | jq -R . | jq -s .)" \
+      '.sandbox.network.allowedDomains = $domains')
+    echo "$SETTINGS_JSON" > "$PROJECT_ROOT/.claude/settings.local.json"
+    success "Created .claude/settings.local.json"
+  fi
 
   # Fetch preflight hook
   info "Fetching preflight hook..."
@@ -967,11 +1011,12 @@ main() {
   echo ""
   echo "  2. Start Claude and launch the loop:"
   echo "     claude --dangerously-skip-permissions"
-  echo '     /ralph-loop "Continue per .claude/ralph/progress.md" --max-iterations 20'
+  echo '     /ralph-loop "Continue per .claude/ralph/progress.md" --max-iterations 50 --completion-promise "TASK COMPLETE"'
   echo ""
   echo "  The preflight hook handles the rest automatically:"
   echo "    - Verifies sandbox is enabled (configured in settings.local.json)"
   echo "    - Verifies --dangerously-skip-permissions is active"
+  echo "    - Creates a session-stamped progress file from your task"
   echo "    - Creates a ralph/<task-slug> branch if on main/master"
   echo ""
 }
