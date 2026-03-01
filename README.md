@@ -35,6 +35,19 @@ Bovine University runs Claude Code with `--dangerously-skip-permissions` inside 
 curl -fsSL https://raw.githubusercontent.com/Axionatic/bovine-university/main/ralph-setup.sh | bash
 ```
 
+Or clone the repo and run locally (works offline — all templates are inlined):
+
+```bash
+git clone https://github.com/Axionatic/bovine-university.git
+cd your-project && bash /path/to/bovine-university/ralph-setup.sh
+```
+
+To uninstall:
+
+```bash
+bash ralph-setup.sh --uninstall
+```
+
 The setup script will:
 1. **Detect your ecosystem** — scans for package.json, Cargo.toml, go.mod, pyproject.toml, etc. and configures allowed network domains accordingly
 2. **Detect frameworks** — identifies build tools, test runners, and linters to set up quality gate commands
@@ -51,6 +64,7 @@ your-project/
 │   ├── settings.local.json         # Deny rules + sandbox config
 │   ├── ralph/
 │   │   ├── progress.md             # Task file (edit before starting)
+│   │   ├── start-ralph.sh          # Helper to launch a loop session
 │   │   └── .progress-template      # Blank template for session reset
 │   └── hooks/
 │       └── ralph-preflight.sh      # Validates environment + auto-branches
@@ -178,6 +192,14 @@ Status: not_started
 
 ### Step 2: Start the Loop
 
+Using the helper script (validates your task first):
+
+```bash
+.claude/ralph/start-ralph.sh
+```
+
+Or manually:
+
 ```bash
 claude --dangerously-skip-permissions
 /ralph-loop "Continue per .claude/ralph/progress.md" --max-iterations 50 --completion-promise "TASK COMPLETE"
@@ -188,6 +210,7 @@ The preflight hook automatically:
 - Verifies `--dangerously-skip-permissions` is active
 - Detects and blocks concurrent loops
 - Archives stale sessions from cancelled runs
+- Validates that progress.md has a real task defined
 - Creates a session-stamped progress file from your task
 - Creates a `ralph/<task-slug>` branch if on main/master (or switches to it if it already exists)
 - Checks for dirty working directory before branching
