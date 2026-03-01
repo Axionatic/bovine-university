@@ -75,6 +75,22 @@ fi
 # Start new session
 SESSION_ID="$(date +%Y%m%d-%H%M%S)-$$"
 cp "$RALPH_DIR/progress.md" "$RALPH_DIR/progress-${SESSION_ID}.md"
+
+# Validate progress.md has real task content
+TASK_CONTENT=$(sed -n '/^## Task/,/^## /{/^## Task/d;/^## /d;p;}' "$RALPH_DIR/progress-${SESSION_ID}.md" | sed '/^$/d')
+if [[ -z "$TASK_CONTENT" ]] || echo "$TASK_CONTENT" | grep -q '\[Describe your task here'; then
+  rm -f "$RALPH_DIR/progress-${SESSION_ID}.md"
+  jq -n --arg msg "$(printf "progress.md has no task defined.\n\nEdit .claude/ralph/progress.md and fill in the Task section before starting the loop.\nExample:\n\n## Task\nBuild a REST API with CRUD operations for a todo app.")" \
+    '{
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: $msg
+      }
+    }'
+  exit 0
+fi
+
 echo "$SESSION_ID" > "$ACTIVE_FILE"
 
 # Reset progress.md for next task
