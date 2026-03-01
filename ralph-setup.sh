@@ -5,8 +5,6 @@ set -e
 # Configures any project for the ralph-wiggum plugin
 # https://github.com/Axionatic/bovine-university
 
-REPO_URL="https://raw.githubusercontent.com/Axionatic/bovine-university/main"
-
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -47,8 +45,12 @@ fi
 # Check dependencies
 check_deps() {
   command -v jq >/dev/null 2>&1 || error "jq is required. Install: brew install jq / apt install jq"
-  command -v curl >/dev/null 2>&1 || error "curl is required"
+  command -v curl >/dev/null 2>&1 || warn "curl not found (not required for setup, but needed for the install one-liner)"
   command -v git >/dev/null 2>&1 || error "git is required"
+  if ! command -v claude >/dev/null 2>&1; then
+    warn "claude CLI not found. Install: npm install -g @anthropic-ai/claude-code"
+  fi
+  info "Ensure the ralph-wiggum plugin is installed: claude plugins add ralph-wiggum"
 }
 
 # Find project root (look for .git, package.json, etc.)
@@ -64,10 +66,497 @@ find_project_root() {
   echo "$PWD"
 }
 
-# Download template from repo
-fetch_template() {
-  local path="$1"
-  curl -fsSL "$REPO_URL/templates/$path" 2>/dev/null || error "Failed to fetch template: $path"
+# Emit template content — inlined from templates/ directory.
+# Source of truth is the templates/ directory in the repo; keep these in sync.
+
+emit_ralph_md() {
+  cat <<'TEMPLATE_EOF'
+# Ralph Loop Guidelines
+
+Autonomous development via [ralph-wiggum](https://github.com/anthropics/claude-code/blob/main/plugins/ralph-wiggum/README.md). Rules here, task in progress file.
+
+## Core Rules (Parent Orchestrator)
+
+1. **USE SUB-AGENTS**: Never do implementation work directly. Use the **Task tool** to spawn a sub-agent for each step. This keeps your context minimal.
+2. **One step per iteration**: Determine ONE logical step, spawn sub-agent, receive summary, update progress. Then stop.
+3. **Context window**: If context is > 50% full, stop immediately and let the loop restart fresh.
+4. **Minimal prompts**: Generate step-specific prompts for sub-agents. Never pass the full task description repeatedly.
+5. **CRITICAL: Update your session progress file BEFORE stopping.** Every iteration MUST end with an update to your session progress file (resolved via `.claude/ralph/.active`). The next iteration reads this file to determine what to do — if you don't update it, the next iteration will repeat the same work or get confused. Update the Current section, move completed items to Completed, and log the iteration.
+6. **Sandbox + bypass mode**: You are running with `--dangerously-skip-permissions` inside a sandbox. Deny rules in `.claude/settings.local.json` block dangerous commands. The sandbox blocks unauthorized network and filesystem access. Sub-agents inherit all sandbox restrictions and deny rules from the parent session.
+7. **Feature branches**: The preflight hook auto-creates a `ralph/<task-slug>` branch when on main/master. Do not force-push to main or master.
+8. **Document blockers**: If truly blocked, log the issue in the Blockers section of your session progress file, skip to the next unblocked step, and stop. The next iteration will pick up from there.
+9. **Completion promise format**: When task is complete, output `<promise>YOUR_PHRASE</promise>` (XML tags required).
+
+## Session Management
+
+The preflight hook creates a session-stamped progress file for each run:
+- Copies your task from `progress.md` into `progress-<session-id>.md`
+- Writes the session ID to `.claude/ralph/.active`
+- Resets `progress.md` to a blank template
+
+**Resolving your progress file (every iteration):**
+1. Read `.claude/ralph/.active` to get `<session-id>`
+2. Use `.claude/ralph/progress-<session-id>.md` — NOT `progress.md`
+
+**On task completion:** Delete `.claude/ralph/.active` after outputting the completion promise.
+
+## Sub-Agent Prompt Template
+
+Use the **Task tool** to spawn sub-agents. Provide this minimal prompt format:
+
+```
+Step: [Specific action to take]
+Location: [File path(s) if applicable]
+Context: [1-2 sentences of relevant context]
+Reference: Session progress file (via .claude/ralph/.active) for full task context if needed
+Report: [What to return - summary, line count, status, etc.]
+```
+
+## Progress Tracking
+
+**Enabled**: Progress tracked in session progress file (resolved via `.claude/ralph/.active`). This is the source of truth.
+
+### Workflow (with sub-agents)
+1. **Plan** - First iteration: Spawn sub-agent to analyze task, produce step list
+2. **Implement** - Each iteration: Spawn sub-agent for ONE step, update progress
+3. **Review** - After implementation: Spawn review sub-agent (optionally with pr-review-toolkit)
+4. **Fix** - Spawn sub-agent for each fix
+5. **Complete** - Push, create PR if configured, output completion promise
+
+### Progress File Format
+```markdown
+## Task
+[Original task description - written once, never duplicated in prompts]
+
+## Plan
+- [ ] Step 1: Description
+- [ ] Step 2: Description
+- [ ] Step 3: Description
+
+## Current
+Step: 2
+Status: in_progress
+Sub-agent: Implementing createTodo function
+
+## Completed
+- [x] Step 1: Set up API routes (iteration 2)
+  Summary: Created src/api/index.ts with GET/POST/PUT/DELETE routes
+
+## Blockers
+- [Issue and why it's blocked]
+
+## Iteration Log
+- Iteration 1: Planning phase, created 5 steps
+- Iteration 2: Completed step 1 (API routes)
+- Iteration 3: Working on step 2 (createTodo)
+```
+
+### Sub-Agent Interaction Pattern
+```
+Parent reads session progress file -> "Step 2 is next: Implement createTodo"
+                         |
+                         v
+Parent spawns sub-agent: "Implement createTodo in src/api/todos.ts.
+                          API routes already set up in src/api/index.ts.
+                          Return: summary of what was implemented"
+                         |
+                         v
+Sub-agent works (isolated context)
+                         |
+                         v
+Sub-agent returns: "Implemented createTodo with validation, 45 lines"
+                         |
+                         v
+Parent updates session progress file with summary
+                         |
+                         v
+Parent stops (loop restarts fresh)
+```
+
+<!--ralph-option:git_strategy
+{
+  "id": "git_strategy",
+  "question": "Git commit strategy?",
+  "default": 4,
+  "options": [
+    {"value": "never", "label": "Never - I'll handle git myself"},
+    {"value": "once", "label": "Once - Commit when task is complete"},
+    {"value": "each", "label": "Each loop - Commit after every iteration"},
+    {"value": "squash", "label": "Squash - Commit each loop, squash when done (Recommended)"}
+  ]
+}
+-->
+
+## Git Strategy
+
+<!--ralph-option:git_never-->
+**Manual**: Do not make commits. User handles all git operations.
+<!--/ralph-option:git_never-->
+
+<!--ralph-option:git_once-->
+**On Completion**: Commit once when the task is fully complete.
+- Use descriptive commit message summarizing all changes
+<!--/ralph-option:git_once-->
+
+<!--ralph-option:git_each-->
+**Each Loop**: Commit after every iteration.
+- Prefix: `ralph: <brief description>`
+- After each step: (1) update session progress file, (2) run quality gates, (3) `git add` + `git commit`, (4) stop
+- Creates detailed history, may need manual cleanup
+<!--/ralph-option:git_each-->
+
+<!--ralph-option:git_squash-->
+**Squash**: Commit after each loop, squash when task completes.
+- During: `WIP: ralph - <step description>`
+- Final: Squash all WIP commits into a single descriptive commit:
+  ```bash
+  git reset --soft $(git merge-base HEAD <base-branch>) && git commit -m "<descriptive message>"
+  ```
+  where `<base-branch>` is the branch you branched from (typically `main` or `master`).
+<!--/ralph-option:git_squash-->
+
+<!--ralph-option:pr_open-->
+**Branch Strategy**: Push branch and open a PR when task is complete.
+<!--/ralph-option:pr_open-->
+
+<!--ralph-option:pr_merge-->
+**Branch Strategy**: Push branch, open a PR, and auto-merge if there are no conflicts.
+<!--/ralph-option:pr_merge-->
+
+<!--ralph-option:pr_no-->
+**Branch Strategy**: Work in a feature branch but do not push or open a PR.
+<!--/ralph-option:pr_no-->
+
+<!--/ralph-option:git_strategy-->
+
+### On Task Completion
+- Commit final changes (per git strategy above)
+<!--ralph-option:pr_push-->
+- Push branch to origin: `git push -u origin HEAD`
+- Open PR if none exists:
+  - Check: `gh pr list --head $(git branch --show-current) --json number`
+  - Create: `gh pr create --fill`
+<!--/ralph-option:pr_push-->
+<!--ralph-option:pr_automerge-->
+- Auto-merge if no conflicts: `gh pr merge --auto --merge`
+<!--/ralph-option:pr_automerge-->
+<!--ralph-option:pr_push-->
+- **If push or PR creation fails** (e.g. `gh` not available, auth issues, network blocked): log the failure in your session progress file and output a warning: `⚠️ Could not push/create PR automatically. Please push the branch and open a PR manually.` Do NOT let this block the completion promise.
+<!--/ralph-option:pr_push-->
+- **If any git/push/PR operation fails**: log the failure in your session progress file and output a warning. Do NOT let it block the completion promise.
+- Delete `.claude/ralph/.active`
+- Output completion promise
+
+<!--ralph-option:pr_review_toolkit
+{
+  "id": "pr_review_toolkit",
+  "question": "Use pr-review-toolkit for code review?",
+  "default": 1,
+  "options": [
+    {"value": "yes", "label": "Yes - Run code review agents during review phase (Recommended)"},
+    {"value": "no", "label": "No - Skip automated review"}
+  ]
+}
+-->
+
+## Code Review
+
+<!--ralph-option:pr_review_yes-->
+Use pr-review-toolkit agents during the **review phase** (workflow step 3, after all implementation steps are complete):
+- `code-reviewer` - Check adherence to guidelines
+- `silent-failure-hunter` - Find error handling issues
+- `comment-analyzer` - Verify comment accuracy
+
+**Invocation:** Only invoke during review iterations. Do not invoke during planning or implementation.
+**Fallback:** If pr-review-toolkit agents are unavailable (tool not found, plugin not installed), fall back to manual self-review: re-read all changed files and check for obvious issues, missed edge cases, and guideline violations.
+Note: Consumes additional tokens. Disable if context is limited.
+<!--/ralph-option:pr_review_yes-->
+
+<!--ralph-option:pr_review_no-->
+Skip automated review. Manual review only.
+<!--/ralph-option:pr_review_no-->
+
+<!--/ralph-option:pr_review_toolkit-->
+
+## Quality Gates
+<!--ralph-option:quality_gates-->
+Run these commands to validate changes before committing:
+<!--ralph-quality-gate-commands-->
+All quality gate commands must exit 0 before committing. If any gate fails:
+1. Fix the issues identified by the failing gate
+2. Re-run the gate to confirm the fix
+3. Only then proceed to commit
+<!--/ralph-option:quality_gates-->
+
+## Invocation
+
+### Step 1: Write your task to progress.md
+
+Edit `.claude/ralph/progress.md` and fill in the Task section:
+
+```bash
+vim .claude/ralph/progress.md
+```
+
+### Step 2: Start the loop with minimal prompt
+
+```bash
+/ralph-loop "Continue per .claude/ralph/progress.md" --max-iterations 50 --completion-promise "TASK COMPLETE"
+```
+
+Only "Continue per .claude/ralph/progress.md" gets duplicated - the actual task lives in the file.
+TEMPLATE_EOF
+}
+
+emit_progress_template() {
+  cat <<'TEMPLATE_EOF'
+## Task
+[Describe your task here. Be specific about requirements, constraints, and expected outcomes.]
+
+## Plan
+(to be generated by first iteration)
+
+## Current
+Step: 0
+Status: not_started
+
+## Completed
+(none yet)
+
+## Blockers
+(none)
+
+## Iteration Log
+(pending)
+TEMPLATE_EOF
+}
+
+emit_settings_template() {
+  cat <<'TEMPLATE_EOF'
+{
+  "permissions": {
+    "deny": [
+      "Bash(sudo:*)", "Bash(su :*)",
+      "Bash(chmod +s:*)", "Bash(chmod u+s:*)", "Bash(chown:*)",
+      "Bash(eval:*)", "Bash(exec:*)",
+      "Bash(bash -c:*)", "Bash(sh -c:*)",
+      "Bash(zsh -c:*)", "Bash(dash -c:*)", "Bash(ksh -c:*)",
+      "Bash(python -c:*)", "Bash(python3 -c:*)",
+      "Bash(perl -e:*)", "Bash(perl -E:*)",
+      "Bash(ruby -e:*)",
+      "Bash(node -e:*)", "Bash(node --eval:*)",
+      "Bash(curl * | bash:*)", "Bash(curl * | sh:*)",
+      "Bash(wget * | bash:*)", "Bash(wget * | sh:*)",
+      "Bash(git push --force origin main:*)",
+      "Bash(git push --force origin master:*)",
+      "Bash(git push -f origin main:*)",
+      "Bash(git push -f origin master:*)",
+      "Bash(git push --force-with-lease origin main:*)",
+      "Bash(git push --force-with-lease origin master:*)",
+      "Bash(git push origin +refs/heads/main:*)",
+      "Bash(git push origin +refs/heads/master:*)",
+      "Bash(git push origin +main:*)",
+      "Bash(git push origin +master:*)"
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "allowUnsandboxedCommands": false,
+    "network": {
+      "allowedDomains": []
+    },
+    "filesystem": {
+      "denyRead": [
+        "~/.ssh", "~/.aws", "~/.gnupg", "~/.config/gcloud",
+        "~/.kube", "~/.docker", "~/.git-credentials",
+        "~/.config/gh", "~/.npmrc", "~/.netrc"
+      ],
+      "denyWrite": [
+        ".claude/settings*", ".claude/RALPH.md",
+        ".claude/hooks/*",
+        ".env", ".env.*", "*.pem", "*.key"
+      ]
+    }
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Skill",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/ralph-preflight.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}
+TEMPLATE_EOF
+}
+
+emit_preflight_hook() {
+  cat <<'TEMPLATE_EOF'
+#!/bin/bash
+# Ralph preflight hook — validates environment and auto-creates feature branch.
+# Fires on PreToolUse for the Skill tool; ignores everything except ralph-loop.
+
+INPUT=$(cat)
+TOOL=$(echo "$INPUT" | jq -r '.tool_name')
+SKILL=$(echo "$INPUT" | jq -r '.tool_input.skill // empty')
+
+# Only care about ralph-loop invocations
+[[ "$TOOL" != "Skill" || "$SKILL" != *"ralph-loop"* ]] && exit 0
+
+# --- Validate environment ---
+MODE=$(echo "$INPUT" | jq -r '.permission_mode')
+SETTINGS="$CLAUDE_PROJECT_DIR/.claude/settings.local.json"
+SANDBOX=$(jq -r '.sandbox.enabled // false' "$SETTINGS" 2>/dev/null)
+
+ERRORS=""
+[[ "$MODE" != "bypassPermissions" ]] && ERRORS+="• --dangerously-skip-permissions is not active\n"
+[[ "$SANDBOX" != "true" ]] && ERRORS+="• Sandbox is not enabled in .claude/settings.local.json\n"
+
+if [[ -n "$ERRORS" ]]; then
+  jq -n --arg msg "$(printf "Ralph loop requires BOTH bypass permissions AND sandbox:\n${ERRORS}\nStart claude with: claude --dangerously-skip-permissions\nEnsure sandbox.enabled is true in .claude/settings.local.json")" \
+    '{
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: $msg
+      }
+    }'
+  exit 0
+fi
+
+# --- Session management ---
+RALPH_DIR="$CLAUDE_PROJECT_DIR/.claude/ralph"
+ACTIVE_FILE="$RALPH_DIR/.active"
+ARCHIVE_DIR="$RALPH_DIR/archive"
+TEMPLATE_FILE="$RALPH_DIR/.progress-template"
+
+# Check for concurrent loop or stale session
+LOOP_MARKER="$CLAUDE_PROJECT_DIR/.claude/ralph-loop.local.md"
+if [[ -f "$ACTIVE_FILE" ]]; then
+  if [[ -f "$LOOP_MARKER" ]]; then
+    # A loop is currently running — deny
+    jq -n --arg msg "A ralph-loop is already running (session: $(cat "$ACTIVE_FILE")). Stop the current loop before starting a new one." \
+      '{
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: $msg
+        }
+      }'
+    exit 0
+  fi
+
+  # No loop running but .active exists — stale from cancelled run, clean up
+  OLD_SESSION=$(cat "$ACTIVE_FILE")
+  OLD_PROGRESS="$RALPH_DIR/progress-${OLD_SESSION}.md"
+  if [[ -f "$OLD_PROGRESS" ]]; then
+    mkdir -p "$ARCHIVE_DIR"
+    mv "$OLD_PROGRESS" "$ARCHIVE_DIR/"
+    # Rotate archive: keep only 10 most recent
+    if [[ -d "$ARCHIVE_DIR" ]]; then
+      ARCHIVE_COUNT=$(ls -1 "$ARCHIVE_DIR" 2>/dev/null | wc -l)
+      if [[ "$ARCHIVE_COUNT" -gt 10 ]]; then
+        ls -1t "$ARCHIVE_DIR" | tail -n +11 | while read -r old; do
+          rm -f "$ARCHIVE_DIR/$old"
+        done
+      fi
+    fi
+    echo "Archived stale session: $OLD_SESSION" >&2
+  fi
+  rm -f "$ACTIVE_FILE"
+fi
+
+# Start new session
+SESSION_ID="$(date +%Y%m%d-%H%M%S)-$$"
+cp "$RALPH_DIR/progress.md" "$RALPH_DIR/progress-${SESSION_ID}.md"
+
+# Validate progress.md has real task content
+TASK_CONTENT=$(sed -n '/^## Task/,/^## /{/^## Task/d;/^## /d;p;}' "$RALPH_DIR/progress-${SESSION_ID}.md" | sed '/^$/d')
+if [[ -z "$TASK_CONTENT" ]] || echo "$TASK_CONTENT" | grep -q '\[Describe your task here'; then
+  rm -f "$RALPH_DIR/progress-${SESSION_ID}.md"
+  jq -n --arg msg "$(printf "progress.md has no task defined.\n\nEdit .claude/ralph/progress.md and fill in the Task section before starting the loop.\nExample:\n\n## Task\nBuild a REST API with CRUD operations for a todo app.")" \
+    '{
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: $msg
+      }
+    }'
+  exit 0
+fi
+
+echo "$SESSION_ID" > "$ACTIVE_FILE"
+
+# Reset progress.md for next task
+if [[ -f "$TEMPLATE_FILE" ]]; then
+  cp "$TEMPLATE_FILE" "$RALPH_DIR/progress.md"
+else
+  echo "Warning: .progress-template not found, progress.md not reset" >&2
+fi
+
+echo "Session started: $SESSION_ID" >&2
+
+# --- Auto-create feature branch if on main/master ---
+CURRENT_BRANCH=$(git -C "$CLAUDE_PROJECT_DIR" branch --show-current 2>/dev/null)
+
+if [[ "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "master" ]]; then
+  PROGRESS="$RALPH_DIR/progress-${SESSION_ID}.md"
+  TASK_LINE=""
+  if [[ -f "$PROGRESS" ]]; then
+    TASK_LINE=$(sed -n '/^## Task/,/^## /{/^## Task/d;/^## /d;/^$/d;p;}' "$PROGRESS" | head -1)
+  fi
+
+  SLUG=$(echo "${TASK_LINE:-unnamed-task}" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed 's/[^a-z0-9]/-/g' \
+    | sed 's/--*/-/g' \
+    | sed 's/^-//' \
+    | sed 's/-$//' \
+    | cut -c1-50)
+
+  BRANCH="ralph/$SLUG"
+
+  # Check for dirty working directory
+  if ! git -C "$CLAUDE_PROJECT_DIR" diff --quiet 2>/dev/null || \
+     ! git -C "$CLAUDE_PROJECT_DIR" diff --cached --quiet 2>/dev/null; then
+    jq -n --arg msg "Cannot create branch '$BRANCH': working directory has uncommitted changes. Commit or stash changes first." \
+      '{
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: $msg
+        }
+      }'
+    exit 0
+  fi
+
+  # Check if branch already exists
+  if git -C "$CLAUDE_PROJECT_DIR" show-ref --verify --quiet "refs/heads/$BRANCH" 2>/dev/null; then
+    git -C "$CLAUDE_PROJECT_DIR" checkout "$BRANCH" 2>&1 >&2
+    echo "Switched to existing branch: $BRANCH" >&2
+  else
+    if ! git -C "$CLAUDE_PROJECT_DIR" checkout -b "$BRANCH" 2>&1 >&2; then
+      jq -n --arg msg "Failed to create branch '$BRANCH'. Check git status and try again." \
+        '{
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            permissionDecision: "deny",
+            permissionDecisionReason: $msg
+          }
+        }'
+      exit 0
+    fi
+    echo "Created branch: $BRANCH" >&2
+  fi
+fi
+
+exit 0
+TEMPLATE_EOF
 }
 
 # Ask question with numbered options, returns the selected index (1-based)
@@ -77,17 +566,17 @@ ask() {
   local options=("$@")
   local default=1
 
-  echo ""
-  echo -e "${BLUE}$prompt${NC}"
+  echo "" >&2
+  echo -e "${BLUE}$prompt${NC}" >&2
   for i in "${!options[@]}"; do
     local label="${options[$i]}"
     if [[ "$label" == *"(Recommended)"* ]]; then
       default=$((i + 1))
     fi
-    echo "  $((i+1))) $label"
+    echo "  $((i+1))) $label" >&2
   done
 
-  read -p "Choice [$default]: " choice
+  read -p "Choice [$default]: " choice < /dev/tty
   choice="${choice:-$default}"
 
   if ! [[ "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 ]] || [[ "$choice" -gt ${#options[@]} ]]; then
@@ -662,6 +1151,51 @@ detect_frameworks() {
   fi
 }
 
+emit_start_script() {
+  cat <<'TEMPLATE_EOF'
+#!/bin/bash
+# Start a Bovine University ralph-loop session.
+# Generated by ralph-setup.sh — feel free to customise.
+
+set -e
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+PROGRESS=".claude/ralph/progress.md"
+
+# Validate progress.md has real content
+if [[ ! -f "$PROGRESS" ]]; then
+  echo -e "${RED}Error:${NC} $PROGRESS not found. Run ralph-setup.sh first."
+  exit 1
+fi
+
+TASK_CONTENT=$(sed -n '/^## Task/,/^## /{/^## Task/d;/^## /d;p;}' "$PROGRESS" | sed '/^$/d')
+if [[ -z "$TASK_CONTENT" ]] || echo "$TASK_CONTENT" | grep -q '\[Describe your task here'; then
+  echo -e "${RED}Error:${NC} No task defined in $PROGRESS"
+  echo ""
+  echo "Edit the file and fill in the Task section before starting:"
+  echo -e "  ${BOLD}vim $PROGRESS${NC}"
+  exit 1
+fi
+
+echo ""
+echo -e "${GREEN}Task found:${NC}"
+echo "$TASK_CONTENT" | head -3
+echo ""
+
+# Launch Claude with bypass permissions
+echo -e "Starting Claude Code... Once ready, paste this command:"
+echo ""
+echo -e "  ${BOLD}/ralph-loop \"Continue per .claude/ralph/progress.md\" --max-iterations 50 --completion-promise \"TASK COMPLETE\"${NC}"
+echo ""
+
+claude --dangerously-skip-permissions
+TEMPLATE_EOF
+}
+
 # Process RALPH.md template to include only selected options
 process_ralph_template() {
   local template="$1"
@@ -771,9 +1305,93 @@ update_claude_md() {
 }
 
 # ========================================
+# Uninstall
+# ========================================
+uninstall() {
+  local project_dir
+  project_dir=$(find_project_root)
+  echo ""
+  echo "Uninstalling Bovine University from: $project_dir"
+  echo ""
+
+  local removed=0
+
+  # Remove Ralph files
+  for f in ".claude/RALPH.md" ".claude/ralph" ".claude/hooks/ralph-preflight.sh"; do
+    local target="$project_dir/$f"
+    if [[ -e "$target" ]]; then
+      rm -rf "$target"
+      success "Removed $f"
+      removed=$((removed + 1))
+    fi
+  done
+
+  # Remove empty hooks dir
+  if [[ -d "$project_dir/.claude/hooks" ]] && [[ -z "$(ls -A "$project_dir/.claude/hooks")" ]]; then
+    rmdir "$project_dir/.claude/hooks"
+    success "Removed empty .claude/hooks/"
+  fi
+
+  # Settings — confirm before removing since user may have custom rules
+  if [[ -f "$project_dir/.claude/settings.local.json" ]]; then
+    read -p "  Remove .claude/settings.local.json? (may contain custom rules) [y/N]: " CONFIRM
+    if [[ "$CONFIRM" == "y" || "$CONFIRM" == "Y" ]]; then
+      rm -f "$project_dir/.claude/settings.local.json"
+      success "Removed .claude/settings.local.json"
+      removed=$((removed + 1))
+    else
+      info "Kept .claude/settings.local.json"
+    fi
+  fi
+
+  # Clean CLAUDE.md — remove Ralph marker and rule
+  if [[ -f "$project_dir/CLAUDE.md" ]]; then
+    local marker="<!-- Ralph Loop Detection -->"
+    if grep -q "$marker" "$project_dir/CLAUDE.md"; then
+      # Use portable sed: try GNU sed first, fall back to BSD sed
+      if sed --version >/dev/null 2>&1; then
+        sed -i "/$marker/,+1d" "$project_dir/CLAUDE.md"
+      else
+        sed -i '' "/$marker/,+1d" "$project_dir/CLAUDE.md"
+      fi
+      # Remove trailing blank lines
+      if sed --version >/dev/null 2>&1; then
+        sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$project_dir/CLAUDE.md"
+      else
+        sed -i '' -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$project_dir/CLAUDE.md"
+      fi
+      success "Cleaned Ralph references from CLAUDE.md"
+      removed=$((removed + 1))
+    fi
+  fi
+
+  echo ""
+  if [[ $removed -gt 0 ]]; then
+    success "Uninstall complete."
+  else
+    info "Nothing to remove — Bovine University not installed in this project."
+  fi
+}
+
+# ========================================
 # Main setup flow
 # ========================================
 main() {
+  case "${1:-}" in
+    --uninstall)
+      uninstall
+      exit 0
+      ;;
+    --help|-h)
+      echo "Usage: ralph-setup.sh [--uninstall | --help]"
+      echo ""
+      echo "  (no args)    Install Bovine University in the current project"
+      echo "  --uninstall  Remove Bovine University files from the current project"
+      echo "  --help       Show this help"
+      exit 0
+      ;;
+  esac
+
   echo ""
   echo "========================================"
   echo "  Bovine University - Ralph Setup"
@@ -901,6 +1519,7 @@ main() {
   # ========================================
   # Question 3: PR Review Toolkit
   # ========================================
+  info "pr-review-toolkit is a separate plugin. Install with: claude plugins add pr-review-toolkit"
   REVIEW=$(ask "Use pr-review-toolkit for code review?" \
     "Yes - Run code review agents during review phase (Recommended)" \
     "No - Skip automated review")
@@ -925,21 +1544,21 @@ main() {
   mkdir -p "$PROJECT_ROOT/.claude/hooks"
 
   # ========================================
-  # Fetch and process templates
+  # Generate and process templates
   # ========================================
 
-  # Fetch RALPH.md template
-  info "Fetching RALPH.md template..."
-  RALPH_TEMPLATE=$(fetch_template "RALPH.md")
+  # Generate RALPH.md from inline template
+  info "Generating RALPH.md..."
+  RALPH_TEMPLATE=$(emit_ralph_md)
 
   # Process template with selected options
   RALPH_MD=$(process_ralph_template "$RALPH_TEMPLATE" "$GIT_STRATEGY" "$PR_STRATEGY" "$PR_REVIEW")
   echo "$RALPH_MD" > "$PROJECT_ROOT/.claude/RALPH.md"
   success "Created .claude/RALPH.md"
 
-  # Fetch progress.md template
-  info "Fetching progress.md template..."
-  fetch_template ".claude/ralph/progress.md.template" > "$PROJECT_ROOT/.claude/ralph/progress.md"
+  # Generate progress.md from inline template
+  info "Generating progress.md..."
+  emit_progress_template > "$PROJECT_ROOT/.claude/ralph/progress.md"
   success "Created .claude/ralph/progress.md"
 
   # Install progress template as reset source for session management
@@ -972,8 +1591,8 @@ main() {
   fi
 
   if [[ "$SKIP_SETTINGS" != "true" ]]; then
-    info "Fetching settings.local.json..."
-    SETTINGS_TEMPLATE=$(fetch_template ".claude/settings.local.json.template")
+    info "Generating settings.local.json..."
+    SETTINGS_TEMPLATE=$(emit_settings_template)
 
     # Deduplicate domains
     local unique_domains=($(printf '%s\n' "${DETECTED_DOMAINS[@]}" | sort -u))
@@ -985,11 +1604,16 @@ main() {
     success "Created .claude/settings.local.json"
   fi
 
-  # Fetch preflight hook
-  info "Fetching preflight hook..."
-  fetch_template ".claude/hooks/ralph-preflight.sh" > "$PROJECT_ROOT/.claude/hooks/ralph-preflight.sh"
+  # Generate preflight hook from inline template
+  info "Generating preflight hook..."
+  emit_preflight_hook > "$PROJECT_ROOT/.claude/hooks/ralph-preflight.sh"
   chmod +x "$PROJECT_ROOT/.claude/hooks/ralph-preflight.sh"
   success "Created .claude/hooks/ralph-preflight.sh"
+
+  # Generate start helper script
+  emit_start_script > "$PROJECT_ROOT/.claude/ralph/start-ralph.sh"
+  chmod +x "$PROJECT_ROOT/.claude/ralph/start-ralph.sh"
+  success "Created .claude/ralph/start-ralph.sh"
 
   # ========================================
   # Update CLAUDE.md
@@ -1004,20 +1628,28 @@ main() {
   success "Setup complete!"
   echo "========================================"
   echo ""
-  echo "Next steps:"
+  echo -e "${BOLD}Next steps:${NC}"
   echo ""
   echo "  1. Write your task:"
-  echo "     vim .claude/ralph/progress.md"
   echo ""
-  echo "  2. Start Claude and launch the loop:"
-  echo "     claude --dangerously-skip-permissions"
-  echo '     /ralph-loop "Continue per .claude/ralph/progress.md" --max-iterations 50 --completion-promise "TASK COMPLETE"'
+  echo -e "     ${BOLD}vim .claude/ralph/progress.md${NC}"
   echo ""
-  echo "  The preflight hook handles the rest automatically:"
-  echo "    - Verifies sandbox is enabled (configured in settings.local.json)"
-  echo "    - Verifies --dangerously-skip-permissions is active"
-  echo "    - Creates a session-stamped progress file from your task"
-  echo "    - Creates a ralph/<task-slug> branch if on main/master"
+  echo "  2. Start the loop (using the helper script):"
+  echo ""
+  echo -e "     ${BOLD}.claude/ralph/start-ralph.sh${NC}"
+  echo ""
+  echo "     Or manually:"
+  echo ""
+  echo -e "     ${BOLD}claude --dangerously-skip-permissions${NC}"
+  echo -e '     '"${BOLD}"'/ralph-loop "Continue per .claude/ralph/progress.md" --max-iterations 50 --completion-promise "TASK COMPLETE"'"${NC}"
+  echo ""
+  if [[ "$PR_REVIEW" == "yes" ]]; then
+    echo -e "  ${YELLOW}Reminder:${NC} Install pr-review-toolkit if not already present:"
+    echo -e "     ${BOLD}claude plugins add pr-review-toolkit${NC}"
+    echo ""
+  fi
+  echo "  To uninstall:"
+  echo -e "     ${BOLD}bash ralph-setup.sh --uninstall${NC}"
   echo ""
 }
 
