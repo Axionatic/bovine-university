@@ -69,6 +69,10 @@ truncate60() {
   fi
 }
 
+file_mtime() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
+}
+
 # ---------------------------------------------------------------------------
 # Exit handler
 # ---------------------------------------------------------------------------
@@ -80,7 +84,7 @@ on_exit() {
   echo "  uvx claude-code-log \"$JSONL_DIR\" --open-browser"
   echo ""
 }
-trap on_exit INT TERM
+trap on_exit INT TERM EXIT
 
 # ---------------------------------------------------------------------------
 # Header
@@ -242,7 +246,7 @@ while true; do
   if [[ -f "$PROGRESS_PTR" ]]; then
     CURR_PROGRESS=$(cat "$PROGRESS_PTR" 2>/dev/null || true)
   fi
-  if [[ -n "$CURR_PROGRESS" && "$CURR_PROGRESS" != "$PREV_PROGRESS" && -z "$CURR_SESSION" ]]; then
+  if [[ -n "$CURR_PROGRESS" && "$CURR_PROGRESS" != "$PREV_PROGRESS" ]]; then
     # Only log outside session start (already logged above on session start)
     log "$C_GREEN" "SESSION" "Progress: $CURR_PROGRESS"
     PREV_PROGRESS="$CURR_PROGRESS"
@@ -255,8 +259,8 @@ while true; do
     CURR_STEP=$(sed -n '/^## Current/,/^## /{/^## Current/d;/^## /d;p;}' "$CURR_PROGRESS" 2>/dev/null \
       | grep -E '^(Step:|Status:)' | head -2 | tr '\n' ' ' | sed 's/ $//' || true)
     if [[ -n "$CURR_STEP" && "$CURR_STEP" != "$PREV_STEP" ]]; then
-      STEP_NUM=$(echo "$CURR_STEP" | grep -oP '(?<=Step: )\S+' || true)
-      STEP_STATUS=$(echo "$CURR_STEP" | grep -oP '(?<=Status: )\S+' || true)
+      STEP_NUM=$(echo "$CURR_STEP" | sed -n 's/.*Step: \([^ ]*\).*/\1/p' || true)
+      STEP_STATUS=$(echo "$CURR_STEP" | sed -n 's/.*Status: \([^ ]*\).*/\1/p' || true)
       log "$C_GREEN_BOLD" "PROGRESS" "Step: $STEP_NUM → Status: $STEP_STATUS"
       PREV_STEP="$CURR_STEP"
     fi
@@ -280,7 +284,7 @@ while true; do
 
   # Postsetup detection — first non-`---` body line of loop state file
   if [[ -f "$LOOP_MARKER" ]]; then
-    SECOND_DASH=$(grep -n '^---$' "$LOOP_MARKER" 2>/dev/null | awk -F: 'NR==2{print $1}')
+    SECOND_DASH=$(grep -n '^---$' "$LOOP_MARKER" 2>/dev/null | awk -F: 'NR==2{print $1}' || true)
     if [[ -n "$SECOND_DASH" ]]; then
       CURR_LOOP_PROMPT=$(tail -n "+$((SECOND_DASH + 1))" "$LOOP_MARKER" 2>/dev/null \
         | sed '/^$/d' | head -1 || true)
@@ -294,17 +298,19 @@ while true; do
     fi
   fi
 
-  # JSONL detection
-  if [[ -z "$JSONL_FILE" ]] && [[ -d "$JSONL_DIR" ]]; then
-    NEWEST=$(find "$JSONL_DIR" -maxdepth 1 -name '*.jsonl' -newer /tmp \
-      -exec ls -t {} + 2>/dev/null | head -1 || true)
-    # Fallback: just pick the most recently modified jsonl regardless of mtime
-    if [[ -z "$NEWEST" ]]; then
-      NEWEST=$(ls -t "$JSONL_DIR"/*.jsonl 2>/dev/null | head -1 || true)
-    fi
-    if [[ -n "$NEWEST" && -f "$NEWEST" ]]; then
-      # Check modified in last 120s
-      if [[ $(( $(date +%s) - $(stat -c %Y "$NEWEST" 2>/dev/null || echo 0) )) -lt 120 ]]; then
+  # JSONL detection — merged (first-set uses 120s freshness guard; switch uses none)
+  if [[ -d "$JSONL_DIR" ]]; then
+    NEWEST=$(ls -t "$JSONL_DIR"/*.jsonl 2>/dev/null | head -1 || true)
+    if [[ -n "$NEWEST" && "$NEWEST" != "$JSONL_FILE" ]]; then
+      if [[ -z "$JSONL_FILE" ]]; then
+        # First detection: require file modified in last 120s to avoid stale sessions
+        if [[ $(( $(date +%s) - $(file_mtime "$NEWEST") )) -lt 120 ]]; then
+          JSONL_FILE="$NEWEST"
+          JSONL_LINE=0
+          log "$C_DIM" "JSONL" "Watching: $(basename "$JSONL_FILE")"
+        fi
+      else
+        # New session started: switch unconditionally
         JSONL_FILE="$NEWEST"
         JSONL_LINE=0
         log "$C_DIM" "JSONL" "Watching: $(basename "$JSONL_FILE")"
@@ -312,18 +318,12 @@ while true; do
     fi
   fi
 
-  # Re-check for newer JSONL file (e.g. new session)
-  if [[ -n "$JSONL_FILE" ]] && [[ -d "$JSONL_DIR" ]]; then
-    NEWEST=$(ls -t "$JSONL_DIR"/*.jsonl 2>/dev/null | head -1 || true)
-    if [[ -n "$NEWEST" && "$NEWEST" != "$JSONL_FILE" ]]; then
-      JSONL_FILE="$NEWEST"
-      JSONL_LINE=0
-      log "$C_DIM" "JSONL" "Watching: $(basename "$JSONL_FILE")"
-    fi
-  fi
-
   # ---- 3b: JSONL new-line processing ----
   if [[ -n "$JSONL_FILE" && -f "$JSONL_FILE" ]]; then
+    # NOTE: wc -l undercounts when the last line lacks a trailing newline.
+    # In that narrow window, the unterminated line may be re-logged once when
+    # the next line is appended. Claude Code's JSONL writer always terminates
+    # lines, so this is cosmetic-only in practice.
     NEW_LINES=$(wc -l < "$JSONL_FILE" 2>/dev/null || echo 0)
 
     # Handle file replacement (line count decreased)
