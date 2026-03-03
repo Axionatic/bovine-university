@@ -49,8 +49,13 @@ check_deps() {
   command -v git >/dev/null 2>&1 || error "git is required"
   if ! command -v claude >/dev/null 2>&1; then
     warn "claude CLI not found. Install: npm install -g @anthropic-ai/claude-code"
+  else
+    if ! claude plugins list 2>/dev/null | grep -q 'ralph-wiggum'; then
+      warn "ralph-wiggum plugin not found. Install: claude plugins add ralph-wiggum"
+    else
+      success "ralph-wiggum plugin detected"
+    fi
   fi
-  info "Ensure the ralph-wiggum plugin is installed: claude plugins add ralph-wiggum"
 }
 
 # Find project root (look for .git, package.json, etc.)
@@ -81,24 +86,27 @@ Autonomous development via [ralph-wiggum](https://github.com/anthropics/claude-c
 2. **One step per iteration**: Determine ONE logical step, spawn sub-agent, receive summary, update progress. Then stop.
 3. **Context window**: If context is > 50% full, stop immediately and let the loop restart fresh.
 4. **Minimal prompts**: Generate step-specific prompts for sub-agents. Never pass the full task description repeatedly.
-5. **CRITICAL: Update your session progress file BEFORE stopping.** Every iteration MUST end with an update to your session progress file (resolved via `.claude/ralph/.active`). The next iteration reads this file to determine what to do — if you don't update it, the next iteration will repeat the same work or get confused. Update the Current section, move completed items to Completed, and log the iteration.
+5. **CRITICAL: Update your session progress file BEFORE stopping.** Every iteration MUST end with an update to your session progress file (path in `.claude/ralph/.current-progress`). The next iteration reads this file to determine what to do — if you don't update it, the next iteration will repeat the same work or get confused. Update the Current section, move completed items to Completed, and log the step.
 6. **Sandbox + bypass mode**: You are running with `--dangerously-skip-permissions` inside a sandbox. Deny rules in `.claude/settings.local.json` block dangerous commands. The sandbox blocks unauthorized network and filesystem access. Sub-agents inherit all sandbox restrictions and deny rules from the parent session.
 7. **Feature branches**: The preflight hook auto-creates a `ralph/<task-slug>` branch when on main/master. Do not force-push to main or master.
 8. **Document blockers**: If truly blocked, log the issue in the Blockers section of your session progress file, skip to the next unblocked step, and stop. The next iteration will pick up from there.
-9. **Completion promise format**: When task is complete, output `<promise>YOUR_PHRASE</promise>` (XML tags required).
+9. **Completion promise format**: When task is complete, output `<promise>YOUR_PHRASE</promise>` (XML tags required). The parent orchestrator must output this directly — do not delegate to a sub-agent. The phrase is case-sensitive and must match exactly.
 
 ## Session Management
 
 The preflight hook creates a session-stamped progress file for each run:
-- Copies your task from `progress.md` into `progress-<session-id>.md`
+- **Inline mode**: parses your task from the `/ralph-loop` prompt argument, writes it into `progress-<session-id>.md`
+- **Legacy mode**: copies your task from `progress.md` into `progress-<session-id>.md`, resets `progress.md` to blank template
 - Writes the session ID to `.claude/ralph/.active`
-- Resets `progress.md` to a blank template
+- Writes the full path to `.claude/ralph/.current-progress`
+
+The postsetup hook then rewrites the loop state file so each iteration re-injects
+`Continue per <session-file-path>` rather than the full task description.
 
 **Resolving your progress file (every iteration):**
-1. Read `.claude/ralph/.active` to get `<session-id>`
-2. Use `.claude/ralph/progress-<session-id>.md` — NOT `progress.md`
+Read `.claude/ralph/.current-progress` to get the full path to your session progress file. Do NOT use `progress.md`.
 
-**On task completion:** Delete `.claude/ralph/.active` after outputting the completion promise.
+**On task completion:** Delete `.claude/ralph/.active` and `.claude/ralph/.current-progress` after outputting the completion promise.
 
 ## Sub-Agent Prompt Template
 
@@ -108,13 +116,12 @@ Use the **Task tool** to spawn sub-agents. Provide this minimal prompt format:
 Step: [Specific action to take]
 Location: [File path(s) if applicable]
 Context: [1-2 sentences of relevant context]
-Reference: Session progress file (via .claude/ralph/.active) for full task context if needed
 Report: [What to return - summary, line count, status, etc.]
 ```
 
 ## Progress Tracking
 
-**Enabled**: Progress tracked in session progress file (resolved via `.claude/ralph/.active`). This is the source of truth.
+**Enabled**: Progress tracked in session progress file (path in `.claude/ralph/.current-progress`). This is the source of truth.
 
 ### Workflow (with sub-agents)
 1. **Plan** - First iteration: Spawn sub-agent to analyze task, produce step list
@@ -145,10 +152,10 @@ Sub-agent: Implementing createTodo function
 ## Blockers
 - [Issue and why it's blocked]
 
-## Iteration Log
-- Iteration 1: Planning phase, created 5 steps
-- Iteration 2: Completed step 1 (API routes)
-- Iteration 3: Working on step 2 (createTodo)
+## Step Log
+- Step 1: Planning phase, created 5 steps
+- Step 2: Completed step 1 (API routes)
+- Step 3: Working on step 2 (createTodo)
 ```
 
 ### Sub-Agent Interaction Pattern
@@ -244,8 +251,8 @@ Parent stops (loop restarts fresh)
 - **If push or PR creation fails** (e.g. `gh` not available, auth issues, network blocked): log the failure in your session progress file and output a warning: `⚠️ Could not push/create PR automatically. Please push the branch and open a PR manually.` Do NOT let this block the completion promise.
 <!--/ralph-option:pr_push-->
 - **If any git/push/PR operation fails**: log the failure in your session progress file and output a warning. Do NOT let it block the completion promise.
-- Delete `.claude/ralph/.active`
 - Output completion promise
+- Delete `.claude/ralph/.active` and `.claude/ralph/.current-progress`
 
 <!--ralph-option:pr_review_toolkit
 {
@@ -290,21 +297,23 @@ All quality gate commands must exit 0 before committing. If any gate fails:
 
 ## Invocation
 
-### Step 1: Write your task to progress.md
-
-Edit `.claude/ralph/progress.md` and fill in the Task section:
+### Pass your task directly in the prompt
 
 ```bash
-vim .claude/ralph/progress.md
+/ralph-loop "Your task description here" --max-iterations %%MAX_ITERATIONS%% --completion-promise "%%COMPLETION_PHRASE%%"
 ```
 
-### Step 2: Start the loop with minimal prompt
+The preflight hook captures your task, creates a session progress file, and auto-branches.
+The postsetup hook rewrites the loop state file to a minimal prompt — your full task
+is not re-injected on every iteration.
+
+### Legacy mode (pre-written task)
+
+If you prefer to write your task in `progress.md` first:
 
 ```bash
-/ralph-loop "Continue per .claude/ralph/progress.md" --max-iterations 50 --completion-promise "TASK COMPLETE"
+/ralph-loop "Continue per .claude/ralph/progress.md" --max-iterations %%MAX_ITERATIONS%% --completion-promise "%%COMPLETION_PHRASE%%"
 ```
-
-Only "Continue per .claude/ralph/progress.md" gets duplicated - the actual task lives in the file.
 TEMPLATE_EOF
 }
 
@@ -326,7 +335,7 @@ Status: not_started
 ## Blockers
 (none)
 
-## Iteration Log
+## Step Log
 (pending)
 TEMPLATE_EOF
 }
@@ -389,6 +398,17 @@ emit_settings_template() {
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/ralph-postsetup.sh\""
+          }
+        ]
+      }
     ]
   }
 }
@@ -406,7 +426,10 @@ TOOL=$(echo "$INPUT" | jq -r '.tool_name')
 SKILL=$(echo "$INPUT" | jq -r '.tool_input.skill // empty')
 
 # Only care about ralph-loop invocations
-[[ "$TOOL" != "Skill" || "$SKILL" != *"ralph-loop"* ]] && exit 0
+if [[ "$TOOL" != "Skill" || "$SKILL" != *"ralph-loop"* ]]; then
+  echo "ralph-preflight: skipping (tool=$TOOL, skill=$SKILL)" >&2
+  exit 0
+fi
 
 # --- Validate environment ---
 MODE=$(echo "$INPUT" | jq -r '.permission_mode')
@@ -414,7 +437,11 @@ SETTINGS="$CLAUDE_PROJECT_DIR/.claude/settings.local.json"
 SANDBOX=$(jq -r '.sandbox.enabled // false' "$SETTINGS" 2>/dev/null)
 
 ERRORS=""
-[[ "$MODE" != "bypassPermissions" ]] && ERRORS+="• --dangerously-skip-permissions is not active\n"
+if [[ "$MODE" == "null" || -z "$MODE" ]]; then
+  ERRORS+="• permission_mode field not found (unexpected platform change?)\n"
+elif [[ "$MODE" != "bypassPermissions" ]]; then
+  ERRORS+="• --dangerously-skip-permissions is not active (mode: $MODE)\n"
+fi
 [[ "$SANDBOX" != "true" ]] && ERRORS+="• Sandbox is not enabled in .claude/settings.local.json\n"
 
 if [[ -n "$ERRORS" ]]; then
@@ -429,7 +456,7 @@ if [[ -n "$ERRORS" ]]; then
   exit 0
 fi
 
-# --- Session management ---
+# --- Pre-session checks ---
 RALPH_DIR="$CLAUDE_PROJECT_DIR/.claude/ralph"
 ACTIVE_FILE="$RALPH_DIR/.active"
 ARCHIVE_DIR="$RALPH_DIR/archive"
@@ -469,48 +496,58 @@ if [[ -f "$ACTIVE_FILE" ]]; then
     echo "Archived stale session: $OLD_SESSION" >&2
   fi
   rm -f "$ACTIVE_FILE"
+  rm -f "$RALPH_DIR/.current-progress"
 fi
 
-# Start new session
-SESSION_ID="$(date +%Y%m%d-%H%M%S)-$$"
-cp "$RALPH_DIR/progress.md" "$RALPH_DIR/progress-${SESSION_ID}.md"
+# --- Parse task from args ---
+ARGS_RAW=$(echo "$INPUT" | jq -r '.tool_input.args // empty')
 
-# Validate progress.md has real task content
-TASK_CONTENT=$(sed -n '/^## Task/,/^## /{/^## Task/d;/^## /d;p;}' "$RALPH_DIR/progress-${SESSION_ID}.md" | sed '/^$/d')
-if [[ -z "$TASK_CONTENT" ]] || echo "$TASK_CONTENT" | grep -q '\[Describe your task here'; then
-  rm -f "$RALPH_DIR/progress-${SESSION_ID}.md"
-  jq -n --arg msg "$(printf "progress.md has no task defined.\n\nEdit .claude/ralph/progress.md and fill in the Task section before starting the loop.\nExample:\n\n## Task\nBuild a REST API with CRUD operations for a todo app.")" \
-    '{
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        permissionDecision: "deny",
-        permissionDecisionReason: $msg
-      }
-    }'
+# Pass-through for help flags — don't set up a session
+if [[ "$ARGS_RAW" == "--help" || "$ARGS_RAW" == "-h" ]]; then
   exit 0
 fi
 
-echo "$SESSION_ID" > "$ACTIVE_FILE"
+# Word-split the args string respecting shell quoting
+# (safe: deny rules apply to Claude's Bash tool calls, not hook script internals)
+eval set -- $ARGS_RAW 2>/dev/null || true
 
-# Reset progress.md for next task
-if [[ -f "$TEMPLATE_FILE" ]]; then
-  cp "$TEMPLATE_FILE" "$RALPH_DIR/progress.md"
+TASK_PARTS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --max-iterations)     shift 2 ;;
+    --completion-promise) shift 2 ;;
+    *)                    TASK_PARTS+=("$1"); shift ;;
+  esac
+done
+TASK_FROM_ARGS="${TASK_PARTS[*]}"
+
+# Detect legacy mode: user passed "Continue per .claude/ralph/progress.md"
+if [[ "$TASK_FROM_ARGS" == Continue\ per\ * ]]; then
+  INLINE_MODE=false
+  TASK_CONTENT=$(sed -n '/^## Task/,/^## /{/^## Task/d;/^## /d;p;}' "$RALPH_DIR/progress.md" | sed '/^$/d')
+  if [[ -z "$TASK_CONTENT" ]] || echo "$TASK_CONTENT" | grep -q '\[Describe your task here'; then
+    jq -n --arg msg "$(printf "progress.md has no task defined.\n\nEdit .claude/ralph/progress.md and fill in the Task section, or\npass your task directly: /ralph-loop \"Your task here\"")" \
+      '{ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $msg } }'
+    exit 0
+  fi
+  TASK_LINE=$(echo "$TASK_CONTENT" | head -1)
 else
-  echo "Warning: .progress-template not found, progress.md not reset" >&2
+  INLINE_MODE=true
+  TASK_FROM_ARGS_TRIMMED=$(echo "$TASK_FROM_ARGS" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+  if [[ -z "$TASK_FROM_ARGS_TRIMMED" ]]; then
+    jq -n --arg msg "$(printf "No task provided.\n\nUsage: /ralph-loop \"Your task here\" --max-iterations 50 --completion-promise \"TASK COMPLETE\"")" \
+      '{ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $msg } }'
+    exit 0
+  fi
+  TASK_CONTENT="$TASK_FROM_ARGS_TRIMMED"
+  TASK_LINE=$(echo "$TASK_FROM_ARGS_TRIMMED" | head -1)
 fi
 
-echo "Session started: $SESSION_ID" >&2
-
-# --- Auto-create feature branch if on main/master ---
+# Check dirty working directory BEFORE creating session files
+# (avoids data loss if branching is denied after files are written)
 CURRENT_BRANCH=$(git -C "$CLAUDE_PROJECT_DIR" branch --show-current 2>/dev/null)
 
 if [[ "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "master" ]]; then
-  PROGRESS="$RALPH_DIR/progress-${SESSION_ID}.md"
-  TASK_LINE=""
-  if [[ -f "$PROGRESS" ]]; then
-    TASK_LINE=$(sed -n '/^## Task/,/^## /{/^## Task/d;/^## /d;/^$/d;p;}' "$PROGRESS" | head -1)
-  fi
-
   SLUG=$(echo "${TASK_LINE:-unnamed-task}" \
     | tr '[:upper:]' '[:lower:]' \
     | sed 's/[^a-z0-9]/-/g' \
@@ -521,7 +558,6 @@ if [[ "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "master" ]]; then
 
   BRANCH="ralph/$SLUG"
 
-  # Check for dirty working directory
   if ! git -C "$CLAUDE_PROJECT_DIR" diff --quiet 2>/dev/null || \
      ! git -C "$CLAUDE_PROJECT_DIR" diff --cached --quiet 2>/dev/null; then
     jq -n --arg msg "Cannot create branch '$BRANCH': working directory has uncommitted changes. Commit or stash changes first." \
@@ -534,7 +570,51 @@ if [[ "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "master" ]]; then
       }'
     exit 0
   fi
+fi
 
+# --- Session management (all pre-checks passed) ---
+SESSION_ID="$(date +%Y%m%d-%H%M%S)-$$"
+echo "$SESSION_ID" > "$ACTIVE_FILE"
+echo "$RALPH_DIR/progress-${SESSION_ID}.md" > "$RALPH_DIR/.current-progress"
+
+if [[ "$INLINE_MODE" == "true" ]]; then
+  # Write session progress file pre-populated with the inline task
+  cat > "$RALPH_DIR/progress-${SESSION_ID}.md" <<PROGRESS_EOF
+## Task
+${TASK_CONTENT}
+
+## Plan
+(to be generated by first iteration)
+
+## Current
+Step: 0
+Status: not_started
+
+## Completed
+(none yet)
+
+## Blockers
+(none)
+
+## Step Log
+(pending)
+PROGRESS_EOF
+  # progress.md is untouched in inline mode
+else
+  # Legacy: copy progress.md → session file, reset progress.md from template
+  cp "$RALPH_DIR/progress.md" "$RALPH_DIR/progress-${SESSION_ID}.md"
+  if [[ -f "$TEMPLATE_FILE" ]]; then
+    cp "$TEMPLATE_FILE" "$RALPH_DIR/progress.md"
+  else
+    echo "Warning: .progress-template not found, progress.md not reset" >&2
+  fi
+fi
+
+echo "Session started: $SESSION_ID" >&2
+
+# --- Auto-create feature branch if on main/master ---
+# (dirty dir already checked above)
+if [[ "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "master" ]]; then
   # Check if branch already exists
   if git -C "$CLAUDE_PROJECT_DIR" show-ref --verify --quiet "refs/heads/$BRANCH" 2>/dev/null; then
     git -C "$CLAUDE_PROJECT_DIR" checkout "$BRANCH" 2>&1 >&2
@@ -555,6 +635,53 @@ if [[ "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "master" ]]; then
   fi
 fi
 
+exit 0
+TEMPLATE_EOF
+}
+
+emit_postsetup_hook() {
+  cat <<'TEMPLATE_EOF'
+#!/bin/bash
+# Ralph postsetup hook — rewrites ralph-loop state file to use minimal session prompt.
+# Fires on PostToolUse for Bash; only acts on setup-ralph-loop.sh invocations.
+
+INPUT=$(cat)
+TOOL=$(echo "$INPUT" | jq -r '.tool_name')
+CMD=$(echo "$INPUT"  | jq -r '.tool_input.command // empty')
+
+# Only care about setup-ralph-loop.sh calls
+if [[ "$TOOL" != "Bash" ]] || ! echo "$CMD" | grep -q 'setup-ralph-loop\.sh'; then
+  exit 0
+fi
+
+STATE_FILE="$CLAUDE_PROJECT_DIR/.claude/ralph-loop.local.md"
+PROGRESS_PTR="$CLAUDE_PROJECT_DIR/.claude/ralph/.current-progress"
+
+if [[ ! -f "$STATE_FILE" ]]; then
+  echo "ralph-postsetup: state file not found, skipping" >&2
+  exit 0
+fi
+if [[ ! -f "$PROGRESS_PTR" ]]; then
+  echo "ralph-postsetup: .current-progress not found, skipping" >&2
+  exit 0
+fi
+
+SESSION_PROGRESS_PATH=$(cat "$PROGRESS_PTR")
+
+# Extract frontmatter (lines 1 through second "---" inclusive)
+SECOND_DASH=$(grep -n '^---$' "$STATE_FILE" | awk -F: 'NR==2{print $1}')
+if [[ -z "$SECOND_DASH" ]]; then
+  echo "ralph-postsetup: cannot parse state file frontmatter, skipping" >&2
+  exit 0
+fi
+FRONTMATTER=$(head -n "$SECOND_DASH" "$STATE_FILE")
+
+# Rewrite state file: same frontmatter, minimal prompt
+TEMP_FILE="${STATE_FILE}.tmp.$$"
+printf '%s\n\nContinue per %s\n' "$FRONTMATTER" "$SESSION_PROGRESS_PATH" > "$TEMP_FILE"
+mv "$TEMP_FILE" "$STATE_FILE"
+
+echo "ralph-postsetup: loop prompt → Continue per $SESSION_PROGRESS_PATH" >&2
 exit 0
 TEMPLATE_EOF
 }
@@ -1166,30 +1293,33 @@ NC='\033[0m'
 
 PROGRESS=".claude/ralph/progress.md"
 
-# Validate progress.md has real content
+# Validate progress.md exists
 if [[ ! -f "$PROGRESS" ]]; then
   echo -e "${RED}Error:${NC} $PROGRESS not found. Run ralph-setup.sh first."
   exit 1
 fi
 
-TASK_CONTENT=$(sed -n '/^## Task/,/^## /{/^## Task/d;/^## /d;p;}' "$PROGRESS" | sed '/^$/d')
-if [[ -z "$TASK_CONTENT" ]] || echo "$TASK_CONTENT" | grep -q '\[Describe your task here'; then
-  echo -e "${RED}Error:${NC} No task defined in $PROGRESS"
-  echo ""
-  echo "Edit the file and fill in the Task section before starting:"
-  echo -e "  ${BOLD}vim $PROGRESS${NC}"
-  exit 1
+# Warn if ralph-wiggum plugin is missing
+if command -v claude >/dev/null 2>&1; then
+  if ! claude plugins list 2>/dev/null | grep -q 'ralph-wiggum'; then
+    echo -e "${RED}Warning:${NC} ralph-wiggum plugin not found. Install: claude plugins add ralph-wiggum"
+  fi
 fi
 
 echo ""
-echo -e "${GREEN}Task found:${NC}"
-echo "$TASK_CONTENT" | head -3
-echo ""
 
-# Launch Claude with bypass permissions
-echo -e "Starting Claude Code... Once ready, paste this command:"
-echo ""
-echo -e "  ${BOLD}/ralph-loop \"Continue per .claude/ralph/progress.md\" --max-iterations 50 --completion-promise \"TASK COMPLETE\"${NC}"
+# If progress.md has a task, show legacy-mode command; otherwise show inline instructions
+TASK_CONTENT=$(sed -n '/^## Task/,/^## /{/^## Task/d;/^## /d;p;}' "$PROGRESS" | sed '/^$/d')
+if [[ -n "$TASK_CONTENT" ]] && ! echo "$TASK_CONTENT" | grep -q '\[Describe your task here'; then
+  echo -e "${GREEN}Task found in progress.md (legacy mode):${NC}"
+  echo "$TASK_CONTENT" | head -3
+  echo ""
+  echo -e "Paste this command once Claude starts:"
+  echo -e "  ${BOLD}/ralph-loop \"Continue per .claude/ralph/progress.md\" --max-iterations %%MAX_ITERATIONS%% --completion-promise \"%%COMPLETION_PHRASE%%\"${NC}"
+else
+  echo -e "Paste a command like this once Claude starts:"
+  echo -e "  ${BOLD}/ralph-loop \"Your task description here\" --max-iterations %%MAX_ITERATIONS%% --completion-promise \"%%COMPLETION_PHRASE%%\"${NC}"
+fi
 echo ""
 
 claude --dangerously-skip-permissions
@@ -1271,9 +1401,13 @@ process_ralph_template() {
     done
     output=$(echo "$output" | sed "s|<!--ralph-quality-gate-commands-->|$(echo -e "$gates_md")|")
   else
-    # Remove quality gates section entirely if none detected
-    output=$(echo "$output" | sed '/<!--ralph-option:quality_gates-->/,/<!--\/ralph-option:quality_gates-->/d')
+    # Replace quality gates content with guidance text when none detected
+    output=$(echo "$output" | sed 's|<!--ralph-quality-gate-commands-->|No quality gates were auto-detected. Before committing, run the appropriate test, lint, and build commands for your project.|')
   fi
+
+  # Substitute configurable placeholders
+  output=$(echo "$output" | sed "s/%%MAX_ITERATIONS%%/$MAX_ITERATIONS/g")
+  output=$(echo "$output" | sed "s/%%COMPLETION_PHRASE%%/$COMPLETION_PHRASE/g")
 
   # Remove remaining option markers
   output=$(echo "$output" | sed 's/<!--ralph-option:[^>]*-->//g')
@@ -1293,10 +1427,15 @@ update_claude_md() {
 
   if [[ -f "$project_dir/CLAUDE.md" ]]; then
     if ! grep -q "$marker" "$project_dir/CLAUDE.md"; then
-      echo -e "\n$marker\n$rule" >> "$project_dir/CLAUDE.md"
+      # Prepend so the rule doesn't sink below the fold
+      local tmpfile
+      tmpfile=$(mktemp)
+      printf '%s\n%s\n\n' "$marker" "$rule" > "$tmpfile"
+      cat "$project_dir/CLAUDE.md" >> "$tmpfile"
+      mv "$tmpfile" "$project_dir/CLAUDE.md"
       info "Updated existing CLAUDE.md"
     else
-      info "CLAUDE.md already configured"
+      info "CLAUDE.md already configured (RALPH.md regenerated with current settings)"
     fi
   else
     echo -e "$marker\n$rule" > "$project_dir/CLAUDE.md"
@@ -1317,7 +1456,7 @@ uninstall() {
   local removed=0
 
   # Remove Ralph files
-  for f in ".claude/RALPH.md" ".claude/ralph" ".claude/hooks/ralph-preflight.sh"; do
+  for f in ".claude/RALPH.md" ".claude/ralph" ".claude/hooks/ralph-preflight.sh" ".claude/hooks/ralph-postsetup.sh"; do
     local target="$project_dir/$f"
     if [[ -e "$target" ]]; then
       rm -rf "$target"
@@ -1334,13 +1473,20 @@ uninstall() {
 
   # Settings — confirm before removing since user may have custom rules
   if [[ -f "$project_dir/.claude/settings.local.json" ]]; then
-    read -p "  Remove .claude/settings.local.json? (may contain custom rules) [y/N]: " CONFIRM
+    read -p "  Remove .claude/settings.local.json? (may contain custom rules) [y/N]: " CONFIRM < /dev/tty
     if [[ "$CONFIRM" == "y" || "$CONFIRM" == "Y" ]]; then
       rm -f "$project_dir/.claude/settings.local.json"
       success "Removed .claude/settings.local.json"
       removed=$((removed + 1))
     else
-      info "Kept .claude/settings.local.json"
+      # Remove hook registration that references the now-deleted preflight hook
+      if jq -e '.hooks' "$project_dir/.claude/settings.local.json" >/dev/null 2>&1; then
+        local CLEANED
+        CLEANED=$(jq 'del(.hooks)' "$project_dir/.claude/settings.local.json")
+        echo "$CLEANED" > "$project_dir/.claude/settings.local.json"
+        success "Removed hook registration from settings.local.json"
+      fi
+      info "Kept .claude/settings.local.json (hooks removed)"
     fi
   fi
 
@@ -1404,6 +1550,22 @@ main() {
   info "Project root: $PROJECT_ROOT"
 
   # ========================================
+  # Git repo check
+  # ========================================
+  if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
+    echo ""
+    warn "No .git directory found in $PROJECT_ROOT"
+    echo "  Without a git repository, the following features will not work:"
+    echo "    - Auto-branching from main/master"
+    echo "    - Dirty working directory checks"
+    echo "    - Git commit strategies (never/once/each/squash)"
+    echo "    - PR creation"
+    echo ""
+    read -p "  Continue without git? [y/N]: " GIT_CONFIRM < /dev/tty
+    [[ "$GIT_CONFIRM" != "y" && "$GIT_CONFIRM" != "Y" ]] && echo "Aborted." && exit 0
+  fi
+
+  # ========================================
   # Caveat emptor
   # ========================================
   echo ""
@@ -1419,7 +1581,7 @@ main() {
   echo "    - Enable GitHub branch protection on main"
   echo "    - For maximum safety, run in ephemeral/disposable environments"
   echo ""
-  read -p "  Continue? [y/N]: " CONFIRM
+  read -p "  Continue? [y/N]: " CONFIRM < /dev/tty
   [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]] && echo "Aborted." && exit 0
 
   # ========================================
@@ -1456,11 +1618,40 @@ main() {
     fi
 
     echo ""
-    read -p "  Is this correct? [Y/n]: " ECO_CONFIRM
+    read -p "  Is this correct? [Y/n]: " ECO_CONFIRM < /dev/tty
     if [[ "$ECO_CONFIRM" == "n" || "$ECO_CONFIRM" == "N" ]]; then
+      # Offer domain removal
+      echo ""
+      echo "  Current domains:"
+      for i in "${!DETECTED_DOMAINS[@]}"; do
+        echo "    $((i+1))) ${DETECTED_DOMAINS[$i]}"
+      done
+      echo ""
+      echo "  Enter numbers to remove (comma-separated, or press Enter to skip):"
+      read -p "  Remove: " REMOVE_NUMS < /dev/tty
+      if [[ -n "$REMOVE_NUMS" ]]; then
+        IFS=',' read -ra NUMS <<< "$REMOVE_NUMS"
+        # Collect indices to remove (convert to 0-based, sort descending to avoid shift issues)
+        local to_remove=()
+        for n in "${NUMS[@]}"; do
+          n=$(echo "$n" | xargs)
+          if [[ "$n" =~ ^[0-9]+$ ]] && [[ "$n" -ge 1 ]] && [[ "$n" -le ${#DETECTED_DOMAINS[@]} ]]; then
+            to_remove+=($((n-1)))
+          fi
+        done
+        # Sort descending and remove
+        IFS=$'\n' to_remove=($(sort -rn <<< "${to_remove[*]}")); unset IFS
+        for idx in "${to_remove[@]}"; do
+          unset 'DETECTED_DOMAINS[$idx]'
+        done
+        # Re-index array
+        DETECTED_DOMAINS=("${DETECTED_DOMAINS[@]}")
+      fi
+
+      # Offer additions (existing flow)
       echo ""
       echo "  Enter additional allowed domains (comma-separated, or press Enter to skip):"
-      read -p "  Domains: " CUSTOM_DOMAINS
+      read -p "  Domains: " CUSTOM_DOMAINS < /dev/tty
       if [[ -n "$CUSTOM_DOMAINS" ]]; then
         IFS=',' read -ra EXTRA_DOMAINS <<< "$CUSTOM_DOMAINS"
         for d in "${EXTRA_DOMAINS[@]}"; do
@@ -1468,12 +1659,19 @@ main() {
           [[ -n "$d" ]] && validate_domain "$d" && DETECTED_DOMAINS+=("$d")
         done
       fi
+
+      # Show final list for confirmation
+      echo ""
+      echo "  Final domain list:"
+      for domain in "${DETECTED_DOMAINS[@]}"; do
+        echo "    - $domain"
+      done
     fi
   else
     echo ""
     warn "No ecosystem detected."
     echo "  Enter allowed network domains (comma-separated, or press Enter for base only):"
-    read -p "  Domains: " CUSTOM_DOMAINS
+    read -p "  Domains: " CUSTOM_DOMAINS < /dev/tty
     if [[ -n "$CUSTOM_DOMAINS" ]]; then
       IFS=',' read -ra EXTRA_DOMAINS <<< "$CUSTOM_DOMAINS"
       for d in "${EXTRA_DOMAINS[@]}"; do
@@ -1529,17 +1727,78 @@ main() {
     2) PR_REVIEW="no" ;;
   esac
 
+  # ========================================
+  # Question 4: Max Iterations
+  # ========================================
+  echo ""
+  read -p "  Max iterations per loop [50]: " MAX_ITERATIONS_INPUT < /dev/tty
+  MAX_ITERATIONS="${MAX_ITERATIONS_INPUT:-50}"
+  # Validate: must be a positive integer
+  if ! [[ "$MAX_ITERATIONS" =~ ^[1-9][0-9]*$ ]]; then
+    warn "Invalid iteration count '$MAX_ITERATIONS', using default: 50"
+    MAX_ITERATIONS="50"
+  fi
+
+  # ========================================
+  # Question 5: Completion Phrase
+  # ========================================
+  read -p "  Completion phrase [TASK COMPLETE]: " COMPLETION_PHRASE_INPUT < /dev/tty
+  COMPLETION_PHRASE="${COMPLETION_PHRASE_INPUT:-TASK COMPLETE}"
+  # Validate: non-empty, no double quotes (would break CLI argument)
+  if [[ "$COMPLETION_PHRASE" == *'"'* ]]; then
+    warn "Completion phrase cannot contain double quotes, using default: TASK COMPLETE"
+    COMPLETION_PHRASE="TASK COMPLETE"
+  fi
+
   echo ""
   info "Setting up Ralph with:"
   info "  Git: $GIT_STRATEGY"
   info "  PR: $PR_STRATEGY"
   info "  Review: $PR_REVIEW"
+  info "  Max iterations: $MAX_ITERATIONS"
+  info "  Completion phrase: $COMPLETION_PHRASE"
   info "  Ecosystems: $(IFS=', '; echo "${DETECTED_ECOSYSTEMS[*]:-none}")"
   echo ""
 
   # ========================================
+  # Interrupt cleanup
+  # ========================================
+  WRITTEN_FILES=()
+  CREATED_DIRS=()
+  ORIGINAL_CLAUDE_MD=""
+  if [[ -f "$PROJECT_ROOT/CLAUDE.md" ]]; then
+    ORIGINAL_CLAUDE_MD=$(cat "$PROJECT_ROOT/CLAUDE.md")
+  fi
+
+  cleanup_on_interrupt() {
+    echo "" >&2
+    warn "Interrupted — cleaning up partial installation..."
+    # Remove written files in reverse order
+    for (( i=${#WRITTEN_FILES[@]}-1; i>=0; i-- )); do
+      [[ -f "${WRITTEN_FILES[$i]}" ]] && rm -f "${WRITTEN_FILES[$i]}"
+    done
+    # Remove created directories if empty (reverse order)
+    for (( i=${#CREATED_DIRS[@]}-1; i>=0; i-- )); do
+      rmdir "${CREATED_DIRS[$i]}" 2>/dev/null || true
+    done
+    # Restore CLAUDE.md
+    if [[ -n "$ORIGINAL_CLAUDE_MD" ]]; then
+      echo "$ORIGINAL_CLAUDE_MD" > "$PROJECT_ROOT/CLAUDE.md"
+    elif [[ -f "$PROJECT_ROOT/CLAUDE.md" ]]; then
+      # CLAUDE.md was created by us (didn't exist before), remove it
+      rm -f "$PROJECT_ROOT/CLAUDE.md"
+    fi
+    echo "Cleanup complete. No files were installed." >&2
+    exit 1
+  }
+  trap cleanup_on_interrupt INT TERM
+
+  # ========================================
   # Create directories
   # ========================================
+  [[ ! -d "$PROJECT_ROOT/.claude/hooks" ]] && CREATED_DIRS+=("$PROJECT_ROOT/.claude/hooks")
+  [[ ! -d "$PROJECT_ROOT/.claude/ralph" ]] && CREATED_DIRS+=("$PROJECT_ROOT/.claude/ralph")
+  [[ ! -d "$PROJECT_ROOT/.claude" ]] && CREATED_DIRS+=("$PROJECT_ROOT/.claude")
   mkdir -p "$PROJECT_ROOT/.claude/ralph"
   mkdir -p "$PROJECT_ROOT/.claude/hooks"
 
@@ -1554,15 +1813,41 @@ main() {
   # Process template with selected options
   RALPH_MD=$(process_ralph_template "$RALPH_TEMPLATE" "$GIT_STRATEGY" "$PR_STRATEGY" "$PR_REVIEW")
   echo "$RALPH_MD" > "$PROJECT_ROOT/.claude/RALPH.md"
+  WRITTEN_FILES+=("$PROJECT_ROOT/.claude/RALPH.md")
   success "Created .claude/RALPH.md"
 
-  # Generate progress.md from inline template
+  # Generate progress.md from inline template (guard against overwriting real tasks)
   info "Generating progress.md..."
-  emit_progress_template > "$PROJECT_ROOT/.claude/ralph/progress.md"
-  success "Created .claude/ralph/progress.md"
+  local PROGRESS_FILE="$PROJECT_ROOT/.claude/ralph/progress.md"
+  if [[ -f "$PROGRESS_FILE" ]]; then
+    local EXISTING_TASK
+    EXISTING_TASK=$(sed -n '/^## Task/,/^## /{/^## Task/d;/^## /d;p;}' "$PROGRESS_FILE" | sed '/^$/d')
+    if [[ -n "$EXISTING_TASK" ]] && ! echo "$EXISTING_TASK" | grep -q '\[Describe your task here'; then
+      warn "progress.md already has a task defined:"
+      echo "$EXISTING_TASK" | head -3
+      echo ""
+      read -p "  Overwrite progress.md? [y/N]: " OVERWRITE_PROGRESS < /dev/tty
+      if [[ "$OVERWRITE_PROGRESS" != "y" && "$OVERWRITE_PROGRESS" != "Y" ]]; then
+        info "Kept existing progress.md"
+      else
+        emit_progress_template > "$PROGRESS_FILE"
+        WRITTEN_FILES+=("$PROGRESS_FILE")
+        success "Overwrote .claude/ralph/progress.md"
+      fi
+    else
+      emit_progress_template > "$PROGRESS_FILE"
+      WRITTEN_FILES+=("$PROGRESS_FILE")
+      success "Created .claude/ralph/progress.md"
+    fi
+  else
+    emit_progress_template > "$PROGRESS_FILE"
+    WRITTEN_FILES+=("$PROGRESS_FILE")
+    success "Created .claude/ralph/progress.md"
+  fi
 
   # Install progress template as reset source for session management
-  cp "$PROJECT_ROOT/.claude/ralph/progress.md" "$PROJECT_ROOT/.claude/ralph/.progress-template"
+  emit_progress_template > "$PROJECT_ROOT/.claude/ralph/.progress-template"
+  WRITTEN_FILES+=("$PROJECT_ROOT/.claude/ralph/.progress-template")
   success "Created .claude/ralph/.progress-template"
 
   # Fetch settings.local.json and inject domains
@@ -1574,14 +1859,15 @@ main() {
     warn "Existing .claude/settings.local.json detected."
     echo "  Re-running setup will overwrite custom deny rules and domain configurations."
     echo ""
-    read -p "  Overwrite? [y/N]: " OVERWRITE_CONFIRM
+    read -p "  Overwrite? [y/N]: " OVERWRITE_CONFIRM < /dev/tty
     if [[ "$OVERWRITE_CONFIRM" != "y" && "$OVERWRITE_CONFIRM" != "Y" ]]; then
-      read -p "  Update allowed network domains only? [y/N]: " DOMAIN_ONLY
+      read -p "  Update allowed network domains only? [y/N]: " DOMAIN_ONLY < /dev/tty
       if [[ "$DOMAIN_ONLY" == "y" || "$DOMAIN_ONLY" == "Y" ]]; then
         local unique_domains=($(printf '%s\n' "${DETECTED_DOMAINS[@]}" | sort -u))
         SETTINGS_JSON=$(jq --argjson domains "$(printf '%s\n' "${unique_domains[@]}" | jq -R . | jq -s .)" \
           '.sandbox.network.allowedDomains = $domains' "$EXISTING_SETTINGS")
         echo "$SETTINGS_JSON" > "$EXISTING_SETTINGS"
+        WRITTEN_FILES+=("$EXISTING_SETTINGS")
         success "Updated network domains in existing settings.local.json"
       else
         info "Keeping existing settings.local.json unchanged."
@@ -1597,21 +1883,34 @@ main() {
     # Deduplicate domains
     local unique_domains=($(printf '%s\n' "${DETECTED_DOMAINS[@]}" | sort -u))
 
-    # Inject domains via jq
+    # Inject domains and expand ~ to $HOME in denyRead paths
     SETTINGS_JSON=$(echo "$SETTINGS_TEMPLATE" | jq --argjson domains "$(printf '%s\n' "${unique_domains[@]}" | jq -R . | jq -s .)" \
-      '.sandbox.network.allowedDomains = $domains')
+      --arg home "$HOME" \
+      '.sandbox.network.allowedDomains = $domains |
+       .sandbox.filesystem.denyRead = [.sandbox.filesystem.denyRead[] | sub("^~"; $home)]')
     echo "$SETTINGS_JSON" > "$PROJECT_ROOT/.claude/settings.local.json"
+    WRITTEN_FILES+=("$PROJECT_ROOT/.claude/settings.local.json")
     success "Created .claude/settings.local.json"
   fi
 
   # Generate preflight hook from inline template
   info "Generating preflight hook..."
   emit_preflight_hook > "$PROJECT_ROOT/.claude/hooks/ralph-preflight.sh"
+  WRITTEN_FILES+=("$PROJECT_ROOT/.claude/hooks/ralph-preflight.sh")
   chmod +x "$PROJECT_ROOT/.claude/hooks/ralph-preflight.sh"
   success "Created .claude/hooks/ralph-preflight.sh"
 
-  # Generate start helper script
-  emit_start_script > "$PROJECT_ROOT/.claude/ralph/start-ralph.sh"
+  # Generate postsetup hook from inline template
+  info "Generating postsetup hook..."
+  emit_postsetup_hook > "$PROJECT_ROOT/.claude/hooks/ralph-postsetup.sh"
+  WRITTEN_FILES+=("$PROJECT_ROOT/.claude/hooks/ralph-postsetup.sh")
+  chmod +x "$PROJECT_ROOT/.claude/hooks/ralph-postsetup.sh"
+  success "Created .claude/hooks/ralph-postsetup.sh"
+
+  # Generate start helper script (substitute placeholders)
+  emit_start_script | sed "s/%%MAX_ITERATIONS%%/$MAX_ITERATIONS/g; s/%%COMPLETION_PHRASE%%/$COMPLETION_PHRASE/g" \
+    > "$PROJECT_ROOT/.claude/ralph/start-ralph.sh"
+  WRITTEN_FILES+=("$PROJECT_ROOT/.claude/ralph/start-ralph.sh")
   chmod +x "$PROJECT_ROOT/.claude/ralph/start-ralph.sh"
   success "Created .claude/ralph/start-ralph.sh"
 
@@ -1619,6 +1918,9 @@ main() {
   # Update CLAUDE.md
   # ========================================
   update_claude_md "$PROJECT_ROOT"
+
+  # All files written successfully — disarm cleanup trap
+  trap - INT TERM
 
   # ========================================
   # Done!
@@ -1641,7 +1943,7 @@ main() {
   echo "     Or manually:"
   echo ""
   echo -e "     ${BOLD}claude --dangerously-skip-permissions${NC}"
-  echo -e '     '"${BOLD}"'/ralph-loop "Continue per .claude/ralph/progress.md" --max-iterations 50 --completion-promise "TASK COMPLETE"'"${NC}"
+  echo -e "     ${BOLD}/ralph-loop \"Continue per .claude/ralph/progress.md\" --max-iterations $MAX_ITERATIONS --completion-promise \"$COMPLETION_PHRASE\"${NC}"
   echo ""
   if [[ "$PR_REVIEW" == "yes" ]]; then
     echo -e "  ${YELLOW}Reminder:${NC} Install pr-review-toolkit if not already present:"

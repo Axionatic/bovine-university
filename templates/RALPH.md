@@ -8,24 +8,27 @@ Autonomous development via [ralph-wiggum](https://github.com/anthropics/claude-c
 2. **One step per iteration**: Determine ONE logical step, spawn sub-agent, receive summary, update progress. Then stop.
 3. **Context window**: If context is > 50% full, stop immediately and let the loop restart fresh.
 4. **Minimal prompts**: Generate step-specific prompts for sub-agents. Never pass the full task description repeatedly.
-5. **CRITICAL: Update your session progress file BEFORE stopping.** Every iteration MUST end with an update to your session progress file (resolved via `.claude/ralph/.active`). The next iteration reads this file to determine what to do — if you don't update it, the next iteration will repeat the same work or get confused. Update the Current section, move completed items to Completed, and log the iteration.
+5. **CRITICAL: Update your session progress file BEFORE stopping.** Every iteration MUST end with an update to your session progress file (path in `.claude/ralph/.current-progress`). The next iteration reads this file to determine what to do — if you don't update it, the next iteration will repeat the same work or get confused. Update the Current section, move completed items to Completed, and log the step.
 6. **Sandbox + bypass mode**: You are running with `--dangerously-skip-permissions` inside a sandbox. Deny rules in `.claude/settings.local.json` block dangerous commands. The sandbox blocks unauthorized network and filesystem access. Sub-agents inherit all sandbox restrictions and deny rules from the parent session.
 7. **Feature branches**: The preflight hook auto-creates a `ralph/<task-slug>` branch when on main/master. Do not force-push to main or master.
 8. **Document blockers**: If truly blocked, log the issue in the Blockers section of your session progress file, skip to the next unblocked step, and stop. The next iteration will pick up from there.
-9. **Completion promise format**: When task is complete, output `<promise>YOUR_PHRASE</promise>` (XML tags required).
+9. **Completion promise format**: When task is complete, output `<promise>YOUR_PHRASE</promise>` (XML tags required). The parent orchestrator must output this directly — do not delegate to a sub-agent. The phrase is case-sensitive and must match exactly.
 
 ## Session Management
 
 The preflight hook creates a session-stamped progress file for each run:
-- Copies your task from `progress.md` into `progress-<session-id>.md`
+- **Inline mode**: parses your task from the `/ralph-loop` prompt argument, writes it into `progress-<session-id>.md`
+- **Legacy mode**: copies your task from `progress.md` into `progress-<session-id>.md`, resets `progress.md` to blank template
 - Writes the session ID to `.claude/ralph/.active`
-- Resets `progress.md` to a blank template
+- Writes the full path to `.claude/ralph/.current-progress`
+
+The postsetup hook then rewrites the loop state file so each iteration re-injects
+`Continue per <session-file-path>` rather than the full task description.
 
 **Resolving your progress file (every iteration):**
-1. Read `.claude/ralph/.active` to get `<session-id>`
-2. Use `.claude/ralph/progress-<session-id>.md` — NOT `progress.md`
+Read `.claude/ralph/.current-progress` to get the full path to your session progress file. Do NOT use `progress.md`.
 
-**On task completion:** Delete `.claude/ralph/.active` after outputting the completion promise.
+**On task completion:** Delete `.claude/ralph/.active` and `.claude/ralph/.current-progress` after outputting the completion promise.
 
 ## Sub-Agent Prompt Template
 
@@ -35,13 +38,12 @@ Use the **Task tool** to spawn sub-agents. Provide this minimal prompt format:
 Step: [Specific action to take]
 Location: [File path(s) if applicable]
 Context: [1-2 sentences of relevant context]
-Reference: Session progress file (via .claude/ralph/.active) for full task context if needed
 Report: [What to return - summary, line count, status, etc.]
 ```
 
 ## Progress Tracking
 
-**Enabled**: Progress tracked in session progress file (resolved via `.claude/ralph/.active`). This is the source of truth.
+**Enabled**: Progress tracked in session progress file (path in `.claude/ralph/.current-progress`). This is the source of truth.
 
 ### Workflow (with sub-agents)
 1. **Plan** - First iteration: Spawn sub-agent to analyze task, produce step list
@@ -72,10 +74,10 @@ Sub-agent: Implementing createTodo function
 ## Blockers
 - [Issue and why it's blocked]
 
-## Iteration Log
-- Iteration 1: Planning phase, created 5 steps
-- Iteration 2: Completed step 1 (API routes)
-- Iteration 3: Working on step 2 (createTodo)
+## Step Log
+- Step 1: Planning phase, created 5 steps
+- Step 2: Completed step 1 (API routes)
+- Step 3: Working on step 2 (createTodo)
 ```
 
 ### Sub-Agent Interaction Pattern
@@ -171,8 +173,8 @@ Parent stops (loop restarts fresh)
 - **If push or PR creation fails** (e.g. `gh` not available, auth issues, network blocked): log the failure in your session progress file and output a warning: `⚠️ Could not push/create PR automatically. Please push the branch and open a PR manually.` Do NOT let this block the completion promise.
 <!--/ralph-option:pr_push-->
 - **If any git/push/PR operation fails**: log the failure in your session progress file and output a warning. Do NOT let it block the completion promise.
-- Delete `.claude/ralph/.active`
 - Output completion promise
+- Delete `.claude/ralph/.active` and `.claude/ralph/.current-progress`
 
 <!--ralph-option:pr_review_toolkit
 {
@@ -217,18 +219,20 @@ All quality gate commands must exit 0 before committing. If any gate fails:
 
 ## Invocation
 
-### Step 1: Write your task to progress.md
-
-Edit `.claude/ralph/progress.md` and fill in the Task section:
+### Pass your task directly in the prompt
 
 ```bash
-vim .claude/ralph/progress.md
+/ralph-loop "Your task description here" --max-iterations %%MAX_ITERATIONS%% --completion-promise "%%COMPLETION_PHRASE%%"
 ```
 
-### Step 2: Start the loop with minimal prompt
+The preflight hook captures your task, creates a session progress file, and auto-branches.
+The postsetup hook rewrites the loop state file to a minimal prompt — your full task
+is not re-injected on every iteration.
+
+### Legacy mode (pre-written task)
+
+If you prefer to write your task in `progress.md` first:
 
 ```bash
-/ralph-loop "Continue per .claude/ralph/progress.md" --max-iterations 50 --completion-promise "TASK COMPLETE"
+/ralph-loop "Continue per .claude/ralph/progress.md" --max-iterations %%MAX_ITERATIONS%% --completion-promise "%%COMPLETION_PHRASE%%"
 ```
-
-Only "Continue per .claude/ralph/progress.md" gets duplicated - the actual task lives in the file.
