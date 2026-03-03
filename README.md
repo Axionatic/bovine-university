@@ -27,8 +27,6 @@ Bovine University runs Claude Code with `--dangerously-skip-permissions` inside 
 - Enable GitHub branch protection on main
 - For maximum safety, run in ephemeral/disposable environments
 
-**Security note:** Application-level deny rules (Layer 2) use prefix matching — they can be bypassed by reordering arguments or using absolute paths. The OS-level sandbox (Layer 1) is the primary security boundary. Deny rules are a defense-in-depth layer, not a hard barrier.
-
 **Platform requirements:** Linux (bubblewrap) or macOS (Seatbelt). For Windows, use [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install).
 
 ## Installation
@@ -63,7 +61,7 @@ The setup script will:
 your-project/
 ├── .claude/
 │   ├── RALPH.md                    # Rules for Ralph behavior
-│   ├── settings.local.json         # Deny rules + sandbox config
+│   ├── settings.local.json         # Sandbox config + hook registration
 │   ├── ralph/
 │   │   ├── progress.md             # Task file (optional pre-write)
 │   │   ├── start-ralph.sh          # Helper to launch a loop session
@@ -126,10 +124,10 @@ The sub-agent approach solves both:
 
 ## Security Model
 
-Two layers provide defense in depth:
+The sandbox is required — the preflight hook validates it before allowing a loop to start:
 
 ```
-Layer 1: Built-in Sandbox (OS-level)
+Sandbox (OS-level, required)
   - Network isolation (only detected ecosystem domains allowed)
   - Filesystem read protection (~/.ssh, ~/.aws, ~/.gnupg, ~/.config/gcloud,
     ~/.kube, ~/.docker, ~/.git-credentials, ~/.config/gh, ~/.npmrc, ~/.netrc)
@@ -137,14 +135,6 @@ Layer 1: Built-in Sandbox (OS-level)
     .claude/settings*, .claude/RALPH.md, .claude/hooks/*)
   - Blocks unsandboxed commands (allowUnsandboxedCommands: false)
   - Uses bubblewrap (Linux) or Seatbelt (macOS)
-
-Layer 2: Deny Rules (Application-level)
-  - Blocks: sudo, su, privilege escalation (chmod +s, chown)
-  - Blocks: shell interpreters (bash -c, sh -c, zsh -c, dash -c, ksh -c)
-  - Blocks: inline code execution (python -c, perl -e, ruby -e, node -e)
-  - Blocks: pipe-to-shell (curl|bash, curl|sh, wget|bash, wget|sh)
-  - Blocks: force-push to main/master (--force, -f, --force-with-lease, +refspec)
-  - Blocks: eval, exec
 ```
 
 The preflight hook validates the environment (sandbox enabled, bypass-permissions active) before allowing a ralph-loop to start.
@@ -206,6 +196,18 @@ The preflight hook automatically:
 
 The postsetup hook then rewrites the loop state file so each iteration re-injects only `Continue per <session-file-path>` — not the full task.
 
+## Monitoring
+
+`ralph-watch.sh` is an optional real-time observer for watching a ralph loop from a second terminal.
+It tails the Claude session JSONL log and `.claude/ralph/` session files to display a live event stream:
+
+```bash
+bash ralph-watch.sh                        # watch current directory
+bash ralph-watch.sh /path/to/your-project  # watch a specific project
+```
+
+Requires `jq`. Output is color-coded by event type: session lifecycle, tool calls, sub-agent spawns, errors.
+
 ## What Do We Teach Claude at BU?
 
 - You are in a loop. Do one single step of your task, then stop. The loop will handle the rest.
@@ -219,9 +221,8 @@ The postsetup hook then rewrites the loop state file so each iteration re-inject
 
 ## How Can We Be Fully Autonomous?
 
-With `--dangerously-skip-permissions`, deny rules still take precedence. We:
+With `--dangerously-skip-permissions`, the sandbox still enforces restrictions. We:
 - Run inside Claude Code's built-in sandbox for OS-level network and filesystem isolation
-- Define deny rules in `.claude/settings.local.json` to block dangerous commands (sudo, su, shell interpreters, inline code execution, pipe-to-shell, force-push to main, privilege escalation)
 - Use a preflight hook that validates the environment and creates the session progress file before allowing a loop to start
 - Use a postsetup hook that rewrites the loop state file to a minimal prompt, preventing full task re-injection on every iteration
 

@@ -87,7 +87,7 @@ Autonomous development via [ralph-wiggum](https://github.com/anthropics/claude-c
 3. **Context window**: If context is > 50% full, stop immediately and let the loop restart fresh.
 4. **Minimal prompts**: Generate step-specific prompts for sub-agents. Never pass the full task description repeatedly.
 5. **CRITICAL: Update your session progress file BEFORE stopping.** Every iteration MUST end with an update to your session progress file (path in `.claude/ralph/.current-progress`). The next iteration reads this file to determine what to do — if you don't update it, the next iteration will repeat the same work or get confused. Update the Current section, move completed items to Completed, and log the step.
-6. **Sandbox + bypass mode**: You are running with `--dangerously-skip-permissions` inside a sandbox. Deny rules in `.claude/settings.local.json` block dangerous commands. The sandbox blocks unauthorized network and filesystem access. Sub-agents inherit all sandbox restrictions and deny rules from the parent session.
+6. **Sandbox + bypass mode**: You are running with `--dangerously-skip-permissions` inside a sandbox. The sandbox blocks unauthorized network and filesystem access. Sub-agents inherit all sandbox restrictions from the parent session.
 7. **Feature branches**: The preflight hook auto-creates a `ralph/<task-slug>` branch when on main/master. Do not force-push to main or master.
 8. **Document blockers**: If truly blocked, log the issue in the Blockers section of your session progress file, skip to the next unblocked step, and stop. The next iteration will pick up from there.
 9. **Completion promise format**: When task is complete, output `<promise>YOUR_PHRASE</promise>` (XML tags required). The parent orchestrator must output this directly — do not delegate to a sub-agent. The phrase is case-sensitive and must match exactly.
@@ -343,31 +343,6 @@ TEMPLATE_EOF
 emit_settings_template() {
   cat <<'TEMPLATE_EOF'
 {
-  "permissions": {
-    "deny": [
-      "Bash(sudo:*)", "Bash(su :*)",
-      "Bash(chmod +s:*)", "Bash(chmod u+s:*)", "Bash(chown:*)",
-      "Bash(eval:*)", "Bash(exec:*)",
-      "Bash(bash -c:*)", "Bash(sh -c:*)",
-      "Bash(zsh -c:*)", "Bash(dash -c:*)", "Bash(ksh -c:*)",
-      "Bash(python -c:*)", "Bash(python3 -c:*)",
-      "Bash(perl -e:*)", "Bash(perl -E:*)",
-      "Bash(ruby -e:*)",
-      "Bash(node -e:*)", "Bash(node --eval:*)",
-      "Bash(curl * | bash:*)", "Bash(curl * | sh:*)",
-      "Bash(wget * | bash:*)", "Bash(wget * | sh:*)",
-      "Bash(git push --force origin main:*)",
-      "Bash(git push --force origin master:*)",
-      "Bash(git push -f origin main:*)",
-      "Bash(git push -f origin master:*)",
-      "Bash(git push --force-with-lease origin main:*)",
-      "Bash(git push --force-with-lease origin master:*)",
-      "Bash(git push origin +refs/heads/main:*)",
-      "Bash(git push origin +refs/heads/master:*)",
-      "Bash(git push origin +main:*)",
-      "Bash(git push origin +master:*)"
-    ]
-  },
   "sandbox": {
     "enabled": true,
     "allowUnsandboxedCommands": false,
@@ -1857,7 +1832,7 @@ main() {
   if [[ -f "$EXISTING_SETTINGS" ]]; then
     echo ""
     warn "Existing .claude/settings.local.json detected."
-    echo "  Re-running setup will overwrite custom deny rules and domain configurations."
+    echo "  Re-running setup will overwrite custom sandbox and domain configurations."
     echo ""
     read -p "  Overwrite? [y/N]: " OVERWRITE_CONFIRM < /dev/tty
     if [[ "$OVERWRITE_CONFIRM" != "y" && "$OVERWRITE_CONFIRM" != "Y" ]]; then
